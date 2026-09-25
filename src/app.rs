@@ -13,36 +13,60 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 
 const RESCAN: Duration = Duration::from_secs(1);
 
+/// Show the window, and while Blurman sits in the tray, close it for real. eframe spins a CPU
+/// core when its window is merely hidden, so the tray waits on plain Win32 messages instead.
 pub fn run(shared: Arc<Shared>, startup: bool) -> Result<(), String> {
+    shared
+        .ui_thread
+        .store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+    tray::install_handlers(shared.clone());
+    // A startup launch lives in the tray, and closing its window goes back there.
+    let mut in_tray = startup && tray::sync(true, rules::load().paused).is_ok();
+    loop {
+        if in_tray && !tray::wait_for_open() {
+            return Ok(());
+        }
+        open_window(&shared, startup)?;
+        if !shared.to_tray.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+        in_tray = true;
+    }
+}
+
+fn open_window(shared: &Arc<Shared>, tray_session: bool) -> Result<(), String> {
     let settings = rules::load_settings();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Blurman")
             .with_inner_size([560.0, 800.0])
             .with_min_inner_size([480.0, 600.0])
-            .with_visible(!startup)
             .with_icon(icon_rgba()),
         ..Default::default()
     };
-    eframe::run_native(
+    let app_shared = shared.clone();
+    let result = eframe::run_native(
         "Blurman",
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            let _ = shared.ctx.set(cc.egui_ctx.clone());
+            app_shared.set_ctx(Some(cc.egui_ctx.clone()));
             if let Ok(handle) = cc.window_handle() {
                 if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                    shared.main_window.store(win32.hwnd.get(), Ordering::SeqCst);
+                    app_shared.main_window.store(win32.hwnd.get(), Ordering::SeqCst);
                 }
             }
-            tray::install_handlers(shared.clone());
-            Ok(Box::new(BlurmanApp::new(shared, settings, startup)))
+            Ok(Box::new(BlurmanApp::new(app_shared, settings, tray_session)))
         }),
     )
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string());
+    shared.main_window.store(0, Ordering::SeqCst);
+    shared.set_ctx(None);
+    result
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64,23 +88,16 @@ struct BlurmanApp {
     selected: Option<String>,
     transparency: u8,
     blur: u8,
+    solid_text: bool,
     /// Launched by Windows startup: this session lives in the tray whatever the setting says.
     startup: bool,
-    /// eframe shows the window after painting the first frame, so a tray start keeps it cloaked
-    /// and hides it after that.
-    hide_pending: bool,
 }
 
 impl BlurmanApp {
     fn new(shared: Arc<Shared>, settings: Settings, startup: bool) -> Self {
         let store = rules::load();
         let tray_error = tray::sync(settings.close_to_tray || startup, store.paused).err();
-        let hide_pending = startup && tray_error.is_none();
-        if hide_pending {
-            shared.cloak_window(true);
-        }
         Self {
-            hide_pending,
             shared,
             store,
             settings,
@@ -93,6 +110,7 @@ impl BlurmanApp {
             selected: None,
             transparency: TRANSPARENCY_DEFAULT,
             blur: BLUR_DEFAULT,
+            solid_text: false,
             startup,
         }
     }
@@ -122,7 +140,7 @@ impl BlurmanApp {
 
     fn sliders_from_rule(&mut self) {
         if let Some(rule) = self.selected_rule() {
-            (self.transparency, self.blur) = (rule.transparency, rule.blur);
+            (self.transparency, self.blur, self.solid_text) = (rule.transparency, rule.blur, rule.solid_text);
         }
     }
 
@@ -145,7 +163,7 @@ impl BlurmanApp {
         };
         self.store.paused = false;
         self.store
-            .upsert(rules::new_rule(&process, self.transparency, self.blur));
+            .upsert(rules::new_rule(&process, self.transparency, self.blur, self.solid_text));
         self.publish();
     }
 
@@ -300,6 +318,14 @@ impl BlurmanApp {
                         .changed();
                     ui.end_row();
                 });
+            ui.add_space(6.0);
+            moved |= setting_row(
+                ui,
+                "Solid text  ·  experimental",
+                "Only the background turns to glass; text and images stay solid. Blurman shows a \
+                 live copy of the app, so it uses a little GPU and lags about one frame.",
+                &mut self.solid_text,
+            );
             if ruled && moved {
                 self.frost_selected();
             }
@@ -367,6 +393,9 @@ impl BlurmanApp {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.add(theme::danger_button("Remove").small()).clicked() {
                                     delete = Some(rule.process.clone());
+                                }
+                                if rule.solid_text {
+                                    theme::badge(ui, "Solid text", ACCENT);
                                 }
                             });
                         });
@@ -447,6 +476,22 @@ impl BlurmanApp {
         });
         ui.add_space(4.0);
         theme::card(ui, |ui| {
+            ui.label(theme::card_title("Solid text"));
+            if setting_row(
+                ui,
+                "Keep solid text during fullscreen games",
+                "Off: while a game or other fullscreen app is in front, solid-text apps switch to \
+                 the normal fade so capturing them never costs the game anything.",
+                &mut self.settings.solid_text_in_fullscreen,
+            ) {
+                if let Err(err) = rules::save_settings(&self.settings) {
+                    self.shared.set_status(format!("Could not save settings: {err}"));
+                }
+                ipc::signal(ipc::msg_reload());
+            }
+        });
+        ui.add_space(4.0);
+        theme::card(ui, |ui| {
             ui.label(theme::card_title("Files"));
             ui.label(theme::muted("Rules and settings are saved in"));
             let dir = rules::app_dir();
@@ -471,17 +516,8 @@ impl BlurmanApp {
 impl eframe::App for BlurmanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(RESCAN);
-        if self.hide_pending {
-            if ctx.cumulative_pass_nr() == 0 {
-                ctx.request_repaint();
-            } else {
-                self.hide_pending = false;
-                self.shared.hide_window();
-            }
-        }
         if ctx.input(|input| input.viewport().close_requested()) && self.keeps_in_tray() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.shared.hide_window();
+            self.shared.to_tray.store(true, Ordering::SeqCst);
         }
         self.sync_from_disk();
         if self.scanned.elapsed() >= RESCAN {

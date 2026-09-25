@@ -1,21 +1,24 @@
 //! State shared by the window, the tray, and the effect thread.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::core::BOOL;
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    IsIconic, SetForegroundWindow, ShowWindowAsync, SW_HIDE, SW_RESTORE, SW_SHOW,
+    IsIconic, PostThreadMessageW, SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW,
 };
 
 pub struct Shared {
     pub fallback: AtomicBool,
     /// The effect thread's hidden host window.
     pub host: AtomicIsize,
-    /// The Blurman window, so a second launch or the tray can bring it forward.
+    /// The Blurman window while it is open, so a second launch or the tray can bring it forward.
     pub main_window: AtomicIsize,
-    pub ctx: OnceLock<egui::Context>,
+    /// The thread that runs the window and the tray, woken with `tray::WM_OPEN`.
+    pub ui_thread: AtomicU32,
+    /// Set when the window closes into the tray instead of quitting.
+    pub to_tray: AtomicBool,
+    ctx: Mutex<Option<egui::Context>>,
     /// Bumped whenever the rules file is reloaded, so the window can pick up outside edits.
     pub rules_generation: AtomicU64,
     pub worker_done: AtomicBool,
@@ -28,11 +31,19 @@ impl Shared {
             fallback: AtomicBool::new(false),
             host: AtomicIsize::new(0),
             main_window: AtomicIsize::new(0),
-            ctx: OnceLock::new(),
+            ui_thread: AtomicU32::new(0),
+            to_tray: AtomicBool::new(false),
+            ctx: Mutex::new(None),
             rules_generation: AtomicU64::new(0),
             worker_done: AtomicBool::new(false),
             status: Mutex::new(String::new()),
         })
+    }
+
+    pub fn set_ctx(&self, ctx: Option<egui::Context>) {
+        if let Ok(mut slot) = self.ctx.lock() {
+            *slot = ctx;
+        }
     }
 
     pub fn set_status(&self, text: impl Into<String>) {
@@ -47,50 +58,33 @@ impl Shared {
     }
 
     pub fn repaint(&self) {
-        if let Some(ctx) = self.ctx.get() {
-            ctx.request_repaint();
+        if let Ok(slot) = self.ctx.lock() {
+            if let Some(ctx) = slot.as_ref() {
+                ctx.request_repaint();
+            }
         }
     }
 
-    /// Show and focus the Blurman window. egui does not run frames while its window is hidden,
-    /// so this goes through Win32 directly and works from any thread.
+    /// Bring the Blurman window forward, or open it from the tray. Works from any thread.
     pub fn show_window(&self) {
         let hwnd = crate::target::hwnd_of(self.main_window.load(Ordering::SeqCst));
         if hwnd.0.is_null() {
+            unsafe {
+                let _ = PostThreadMessageW(
+                    self.ui_thread.load(Ordering::SeqCst),
+                    crate::tray::WM_OPEN,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
             return;
         }
-        self.cloak_window(false);
         unsafe {
             let command = if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW };
             let _ = ShowWindowAsync(hwnd, command);
             let _ = SetForegroundWindow(hwnd);
         }
         self.repaint();
-    }
-
-    pub fn hide_window(&self) {
-        let hwnd = crate::target::hwnd_of(self.main_window.load(Ordering::SeqCst));
-        if !hwnd.0.is_null() {
-            unsafe {
-                let _ = ShowWindowAsync(hwnd, SW_HIDE);
-            }
-        }
-    }
-
-    /// A cloaked window stays invisible and off the taskbar even while Windows considers it shown.
-    pub fn cloak_window(&self, cloaked: bool) {
-        let hwnd = crate::target::hwnd_of(self.main_window.load(Ordering::SeqCst));
-        if !hwnd.0.is_null() {
-            let value = BOOL::from(cloaked);
-            unsafe {
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_CLOAK,
-                    (&raw const value).cast(),
-                    size_of::<BOOL>() as u32,
-                );
-            }
-        }
     }
 
     /// Ask the effect thread to put every app back, and wait for it to finish.
@@ -103,8 +97,8 @@ impl Shared {
             let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                 Some(hwnd),
                 crate::ipc::msg_shutdown(),
-                windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM(0),
+                WPARAM(0),
+                LPARAM(0),
             );
         }
         let start = Instant::now();

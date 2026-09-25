@@ -23,6 +23,9 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess, OpenProcessToken,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::{
+    SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetLayeredWindowAttributes, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
@@ -353,6 +356,10 @@ pub fn capture_style(hwnd: HWND) -> SavedStyle {
 }
 
 pub fn apply_alpha(hwnd: HWND, transparency: u8, nudge: bool) -> Result<(), String> {
+    set_alpha(hwnd, mapping::transparency_to_alpha(transparency), nudge)
+}
+
+pub fn set_alpha(hwnd: HWND, alpha: u8, nudge: bool) -> Result<(), String> {
     unsafe {
         if !IsWindow(Some(hwnd)).as_bool() {
             return Err("The window is gone.".into());
@@ -376,7 +383,6 @@ pub fn apply_alpha(hwnd: HWND, transparency: u8, nudge: bool) -> Result<(), Stri
                 nudge_resize(hwnd);
             }
         }
-        let alpha = mapping::transparency_to_alpha(transparency);
         SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).map_err(|err| err.to_string())
     }
 }
@@ -418,6 +424,14 @@ pub fn restore_alpha(hwnd: HWND, saved: &SavedStyle) {
             }
         }
     }
+}
+
+/// A fullscreen game, video, or presentation is in front.
+pub fn fullscreen_in_front() -> bool {
+    matches!(
+        unsafe { SHQueryUserNotificationState() },
+        Ok(QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
+    )
 }
 
 /// The HWND still belongs to the same process instance we saw earlier.

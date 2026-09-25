@@ -9,6 +9,7 @@ mod ipc;
 mod mapping;
 mod rules;
 mod shared;
+mod solid;
 mod target;
 mod theme;
 mod tray;
@@ -45,6 +46,9 @@ enum Command {
         #[arg(long, default_value_t = mapping::BLUR_DEFAULT,
               value_parser = clap::value_parser!(u8).range(mapping::BLUR_MIN as i64..=mapping::BLUR_MAX as i64))]
         blur: u8,
+        /// Keep text and images solid; only the app's background turns to glass. Experimental.
+        #[arg(long)]
+        solid_text: bool,
     },
     /// Take the glass off one app, or every app with --all.
     Clear {
@@ -53,6 +57,9 @@ enum Command {
         #[arg(long, conflicts_with = "process")]
         all: bool,
     },
+    /// Started by Blurman: put apps back if the Blurman with this process id is killed.
+    #[command(hide = true)]
+    Watchdog { parent: u32 },
 }
 
 fn main() {
@@ -70,6 +77,10 @@ fn main() {
         launch(cli.startup);
         return;
     };
+    if let Command::Watchdog { parent } = command {
+        worker::watch(parent);
+        return;
+    }
     ensure_console();
     if let Err(err) = run_command(command) {
         eprintln!("{err}");
@@ -97,8 +108,9 @@ fn run_command(command: Command) -> Result<(), String> {
             process,
             transparency,
             blur,
+            solid_text,
         } => {
-            let rule = rules::new_rule(&process, transparency, blur);
+            let rule = rules::new_rule(&process, transparency, blur, solid_text);
             if rule.process.is_empty() {
                 return Err("Give an app name, like chrome.exe.".into());
             }
@@ -108,10 +120,14 @@ fn run_command(command: Command) -> Result<(), String> {
             rules::save(&store)?;
             ipc::reload_or_launch()?;
             println!(
-                "Frosting {} at transparency {} and blur {}.",
-                rule.process, rule.transparency, rule.blur
+                "Frosting {} at transparency {} and blur {}{}.",
+                rule.process,
+                rule.transparency,
+                rule.blur,
+                if rule.solid_text { " with solid text" } else { "" }
             );
         }
+        Command::Watchdog { .. } => {}
         Command::Clear { process, all } => {
             let mut store = rules::load();
             match process {

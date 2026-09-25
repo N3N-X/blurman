@@ -11,6 +11,9 @@ pub struct Rule {
     pub transparency: u8,
     pub blur: u8,
     pub enabled: bool,
+    /// Keep text and images solid: only the app's background turns to glass.
+    #[serde(default)]
+    pub solid_text: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +96,9 @@ impl PersistedWindow {
 pub struct Settings {
     #[serde(default)]
     pub close_to_tray: bool,
+    /// Keep solid text running while a fullscreen game is in front instead of pausing it.
+    #[serde(default)]
+    pub solid_text_in_fullscreen: bool,
 }
 
 pub fn load_settings() -> Settings {
@@ -160,12 +166,13 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     fs::rename(&temp, path).map_err(|err| err.to_string())
 }
 
-pub fn new_rule(process: &str, transparency: u8, blur: u8) -> Rule {
+pub fn new_rule(process: &str, transparency: u8, blur: u8, solid_text: bool) -> Rule {
     Rule {
         process: mapping::normalize_process(process),
         transparency: mapping::clamp_transparency(transparency),
         blur: mapping::clamp_blur(blur),
         enabled: true,
+        solid_text,
     }
 }
 
@@ -176,11 +183,12 @@ mod tests {
     #[test]
     fn upsert_matches_names_case_insensitively() {
         let mut store = Store::default();
-        store.upsert(new_rule("Chrome", 30, 40));
-        store.upsert(new_rule("chrome.exe", 50, 60));
+        store.upsert(new_rule("Chrome", 30, 40, false));
+        store.upsert(new_rule("chrome.exe", 50, 60, true));
         assert_eq!(store.rules.len(), 1);
         assert_eq!(store.rules[0].transparency, 50);
         assert_eq!(store.rules[0].blur, 60);
+        assert!(store.rules[0].solid_text);
         assert!(store.remove("CHROME.EXE"));
         assert!(store.rules.is_empty());
     }
@@ -197,6 +205,7 @@ mod tests {
         assert_eq!(store.rules[0].process, "notepad.exe");
         assert_eq!(store.rules[0].transparency, mapping::TRANSPARENCY_MAX);
         assert_eq!(store.rules[0].blur, mapping::BLUR_MIN);
+        assert!(!store.rules[0].solid_text);
         assert!(!store.paused);
     }
 }

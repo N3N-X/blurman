@@ -8,6 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_APP,
+};
+
+/// Posted to the UI thread to open the window while Blurman waits in the tray.
+pub const WM_OPEN: u32 = WM_APP + 2;
 
 const OPEN: &str = "open";
 const PAUSE: &str = "pause";
@@ -22,8 +28,23 @@ thread_local! {
     static TRAY: RefCell<Option<Tray>> = const { RefCell::new(None) };
 }
 
-/// Menu and click events arrive on the UI thread even while the window is hidden and egui
-/// is not running frames, so they are handled here instead of in `update`.
+/// Run the tray until something asks for the window. Returns false if the thread is quitting.
+pub fn wait_for_open() -> bool {
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+        if message.hwnd.0.is_null() && message.message == WM_OPEN {
+            return true;
+        }
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    false
+}
+
+/// Menu and click events arrive on the UI thread whether or not the window is open, so they
+/// are handled here instead of in `update`.
 pub fn install_handlers(shared: Arc<Shared>) {
     let menu_shared = shared.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id.0.as_str() {

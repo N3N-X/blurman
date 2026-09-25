@@ -20,12 +20,11 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
-    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
+    ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_BUFFER_DESC,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -55,27 +54,59 @@ const KEY_MIN_SHARE: f32 = 0.2;
 /// How far from the background a pixel must be, as a fraction of the way to black or white,
 /// before it is drawn fully solid. Anti-aliased text edges fall between and blend smoothly.
 const SOLID_AT: f32 = 0.25;
+/// App backgrounds are one flat color, so a pixel only counts as background when it matches
+/// the key exactly. Any looser and smooth gradients in images pick up bands of glass.
+const MATCH_TOLERANCE: f32 = 0.5 / 255.0;
+/// Matching pixels out of the 5x5 around one before it counts as background. Photos and video
+/// only hit the key color in stray pixels, so they stay solid.
+const PATCH_MIN: f32 = 8.0;
 
 const SHADER: &str = r#"
 Texture2D frame : register(t0);
-SamplerState nearest : register(s0);
 cbuffer Params : register(b0) {
-    float4 key;    // background color
-    float4 extra;  // x: background opacity, y: solid threshold, zw: content size / texture size
+    float4 key;    // rgb: background color, a: 1 when the app has one
+    float4 extra;  // x: background opacity, y: solid threshold, z: match tolerance, w: patch minimum
+    float4 area;   // xy: content size in pixels
 };
 
-struct Vertex { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-
-Vertex vs_main(uint id : SV_VertexID) {
+float4 vs_main(uint id : SV_VertexID) : SV_Position {
     float2 corner = float2((id << 1) & 2, id & 2);
-    Vertex v;
-    v.uv = corner * extra.zw;
-    v.pos = float4(corner * float2(2, -2) + float2(-1, 1), 0, 1);
-    return v;
+    return float4(corner * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 
-float4 ps_main(Vertex v) : SV_Target {
-    float4 p = frame.Sample(nearest, v.uv);
+float4 pixel_at(int2 at) {
+    if (any(at < 0) || any(at >= int2(area.xy))) return float4(0, 0, 0, 0);
+    return frame.Load(int3(at, 0));
+}
+
+float4 ps_main(float4 pos : SV_Position) : SV_Target {
+    int2 at = int2(pos.xy);
+    float4 p = pixel_at(at);
+    if (key.a == 0) return p;
+
+    uint match[7][7];
+    [unroll] for (int y = 0; y < 7; y++) {
+        [unroll] for (int x = 0; x < 7; x++) {
+            float4 q = pixel_at(at + int2(x - 3, y - 3));
+            match[y][x] = q.a > 0.99 && all(abs(q.rgb - key.rgb) <= extra.z) ? 1 : 0;
+        }
+    }
+    // Only this pixel and its neighbors can turn to glass, and only when they sit in a patch of
+    // background, so the edge of text blends while everything else stays exactly as it was.
+    bool near_background = false;
+    [unroll] for (int cy = 2; cy <= 4; cy++) {
+        [unroll] for (int cx = 2; cx <= 4; cx++) {
+            uint count = 0;
+            [unroll] for (int dy = -2; dy <= 2; dy++) {
+                [unroll] for (int dx = -2; dx <= 2; dx++) {
+                    count += match[cy + dy][cx + dx];
+                }
+            }
+            near_background = near_background || (match[cy][cx] == 1 && count >= extra.w);
+        }
+    }
+    if (!near_background) return p;
+
     float3 d = p.rgb - key.rgb;
     // How much of the way from the background toward black or white each channel moved.
     float3 room = max(d > 0 ? 1 - key.rgb : key.rgb, 1.0 / 255);
@@ -92,6 +123,7 @@ float4 ps_main(Vertex v) : SV_Target {
 struct Params {
     key: [f32; 4],
     extra: [f32; 4],
+    area: [f32; 4],
 }
 
 fn err(context: &str) -> impl Fn(windows::core::Error) -> String + '_ {
@@ -106,7 +138,6 @@ pub struct Renderer {
     factory: IDXGIFactory2,
     vertex: ID3D11VertexShader,
     pixel: ID3D11PixelShader,
-    sampler: ID3D11SamplerState,
     params: ID3D11Buffer,
 }
 
@@ -149,21 +180,6 @@ impl Renderer {
             device
                 .CreatePixelShader(&compile(s!("ps_main"), s!("ps_5_0"))?, None, Some(&mut pixel))
                 .map_err(err("Pixel shader"))?;
-            let mut sampler = None;
-            device
-                .CreateSamplerState(
-                    &D3D11_SAMPLER_DESC {
-                        Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
-                        AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
-                        AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
-                        AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
-                        ComparisonFunc: D3D11_COMPARISON_NEVER,
-                        MaxLOD: f32::MAX,
-                        ..Default::default()
-                    },
-                    Some(&mut sampler),
-                )
-                .map_err(err("Sampler"))?;
             let mut params = None;
             device
                 .CreateBuffer(
@@ -184,9 +200,49 @@ impl Renderer {
                 factory,
                 vertex: vertex.ok_or("No vertex shader.")?,
                 pixel: pixel.ok_or("No pixel shader.")?,
-                sampler: sampler.ok_or("No sampler.")?,
                 params: params.ok_or("No shader parameters.")?,
             })
+        }
+    }
+
+    /// Draw `source` into `target` with the background color keyed out. Without a background
+    /// color the app is drawn unchanged.
+    fn render(
+        &self,
+        source: &ID3D11ShaderResourceView,
+        target: &ID3D11RenderTargetView,
+        size: SizeInt32,
+        content: SizeInt32,
+        key: Option<[u8; 3]>,
+        background_alpha: f32,
+    ) {
+        let [r, g, b] = key.unwrap_or_default().map(|channel| channel as f32 / 255.0);
+        let params = Params {
+            key: [r, g, b, if key.is_some() { 1.0 } else { 0.0 }],
+            extra: [background_alpha, SOLID_AT, MATCH_TOLERANCE, PATCH_MIN],
+            area: [content.Width as f32, content.Height as f32, 0.0, 0.0],
+        };
+        let context = &self.context;
+        unsafe {
+            context.UpdateSubresource(&self.params, 0, None, (&raw const params).cast(), 0, 0);
+            context.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
+            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: size.Width as f32,
+                Height: size.Height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(&self.vertex, None);
+            context.PSSetShader(&self.pixel, None);
+            context.PSSetConstantBuffers(0, Some(&[Some(self.params.clone())]));
+            context.PSSetShaderResources(0, Some(&[Some(source.clone())]));
+            context.Draw(3, 0);
+            context.PSSetShaderResources(0, Some(&[None]));
+            context.OMSetRenderTargets(None, None);
         }
     }
 }
@@ -320,51 +376,16 @@ impl SolidView {
         let Some((_, view, content)) = &self.last else {
             return Ok(false);
         };
-        let key = self.key.unwrap_or([0, 0, 0]);
-        let context = &renderer.context;
-        unsafe {
-            if self.target_view.is_none() {
-                let back: ID3D11Texture2D = self.swapchain.GetBuffer(0).map_err(err("Back buffer"))?;
-                let mut target_view = None;
-                renderer
-                    .device
-                    .CreateRenderTargetView(&back, None, Some(&mut target_view))
-                    .map_err(err("Render target"))?;
-                self.target_view = target_view;
-            }
-            let params = Params {
-                key: [key[0] as f32 / 255.0, key[1] as f32 / 255.0, key[2] as f32 / 255.0, 1.0],
-                extra: [
-                    background_alpha,
-                    SOLID_AT,
-                    content.Width as f32 / self.size.Width.max(1) as f32,
-                    content.Height as f32 / self.size.Height.max(1) as f32,
-                ],
-            };
-            context.UpdateSubresource(&renderer.params, 0, None, (&raw const params).cast(), 0, 0);
-            context.OMSetRenderTargets(Some(std::slice::from_ref(&self.target_view)), None);
-            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
-                Width: self.size.Width as f32,
-                Height: self.size.Height as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            }]));
-            context.IASetInputLayout(None);
-            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            context.VSSetShader(&renderer.vertex, None);
-            context.PSSetShader(&renderer.pixel, None);
-            let params = Some(renderer.params.clone());
-            context.VSSetConstantBuffers(0, Some(std::slice::from_ref(&params)));
-            context.PSSetConstantBuffers(0, Some(std::slice::from_ref(&params)));
-            context.PSSetShaderResources(0, Some(&[Some(view.clone())]));
-            context.PSSetSamplers(0, Some(&[Some(renderer.sampler.clone())]));
-            context.Draw(3, 0);
-            context.PSSetShaderResources(0, Some(&[None]));
-            context.OMSetRenderTargets(None, None);
-            self.swapchain.Present(0, DXGI_PRESENT(0)).ok().map_err(err("Present"))?;
+        if self.target_view.is_none() {
+            let back: ID3D11Texture2D = unsafe { self.swapchain.GetBuffer(0) }.map_err(err("Back buffer"))?;
+            let mut target_view = None;
+            unsafe { renderer.device.CreateRenderTargetView(&back, None, Some(&mut target_view)) }
+                .map_err(err("Render target"))?;
+            self.target_view = target_view;
         }
+        let target = self.target_view.as_ref().ok_or("No render target.")?;
+        renderer.render(view, target, self.size, *content, self.key, background_alpha);
+        unsafe { self.swapchain.Present(0, DXGI_PRESENT(0)) }.ok().map_err(err("Present"))?;
         Ok(true)
     }
 
@@ -557,5 +578,124 @@ mod tests {
             .flat_map(|i| bgra([(i % 256) as u8, (i * 7 % 256) as u8, 40]))
             .collect();
         assert_eq!(background_color(&pixels), None);
+    }
+
+    const W: u32 = 48;
+    const H: u32 = 40;
+    const KEY: [u8; 3] = [31, 31, 31];
+    const ALPHA: f32 = 0.7;
+
+    /// Dark theme background with a text stroke, a noisy dark photo that often hits the
+    /// background color exactly, and a bright image.
+    fn scene() -> Vec<u8> {
+        let mut pixels = Vec::new();
+        for y in 0..H {
+            for x in 0..W {
+                let rgb = if (4..12).contains(&y) && x == 4 {
+                    [220, 220, 220]
+                } else if (4..12).contains(&y) && x == 5 {
+                    [80, 80, 80]
+                } else if (14..36).contains(&y) && (4..22).contains(&x) {
+                    let noise = (x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663)) % 11;
+                    let v = 26 + noise as u8;
+                    [v, v, v]
+                } else if (14..36).contains(&y) && (26..44).contains(&x) {
+                    [200, (x * 5) as u8, (y * 6) as u8]
+                } else {
+                    KEY
+                };
+                pixels.extend_from_slice(&bgra(rgb));
+            }
+        }
+        pixels
+    }
+
+    /// Run the shader on BGRA pixels and read back the premultiplied BGRA result.
+    fn render_on_gpu(renderer: &Renderer, pixels: &[u8], key: Option<[u8; 3]>) -> Vec<u8> {
+        use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_SUBRESOURCE_DATA};
+        let size = SizeInt32 { Width: W as i32, Height: H as i32 };
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: W,
+            Height: H,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let data = D3D11_SUBRESOURCE_DATA { pSysMem: pixels.as_ptr().cast(), SysMemPitch: W * 4, SysMemSlicePitch: 0 };
+        unsafe {
+            let device = &renderer.device;
+            let (mut source, mut view, mut target, mut target_view, mut staging) = (None, None, None, None, None);
+            device.CreateTexture2D(&desc, Some(&data), Some(&mut source)).unwrap();
+            device.CreateShaderResourceView(source.as_ref().unwrap(), None, Some(&mut view)).unwrap();
+            let target_desc = D3D11_TEXTURE2D_DESC { BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32, ..desc };
+            device.CreateTexture2D(&target_desc, None, Some(&mut target)).unwrap();
+            let target = target.unwrap();
+            device.CreateRenderTargetView(&target, None, Some(&mut target_view)).unwrap();
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..desc
+            };
+            device.CreateTexture2D(&staging_desc, None, Some(&mut staging)).unwrap();
+            let staging = staging.unwrap();
+
+            renderer.render(view.as_ref().unwrap(), target_view.as_ref().unwrap(), size, size, key, ALPHA);
+            renderer.context.CopyResource(&staging, &target);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            renderer.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).unwrap();
+            let mut out = Vec::new();
+            for y in 0..H as usize {
+                let row = (mapped.pData as *const u8).add(y * mapped.RowPitch as usize);
+                out.extend_from_slice(std::slice::from_raw_parts(row, W as usize * 4));
+            }
+            renderer.context.Unmap(&staging, 0);
+            out
+        }
+    }
+
+    fn at(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * W + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    }
+
+    #[test]
+    fn only_the_background_turns_to_glass() {
+        let renderer = match Renderer::new() {
+            Ok(renderer) => renderer,
+            Err(error) => return eprintln!("skipped, no GPU capture: {error}"),
+        };
+        let input = scene();
+        let output = render_on_gpu(&renderer, &input, Some(KEY));
+
+        let glass = (ALPHA * 255.0).round() as i32;
+        let [b, _, _, a] = at(&output, 30, 4);
+        assert!((a as i32 - glass).abs() <= 1, "background alpha {a}");
+        assert!((b as i32 - (31.0 * ALPHA) as i32).abs() <= 1, "background color {b}");
+
+        assert_eq!(at(&output, 4, 8), at(&input, 4, 8), "text stays solid");
+        let edge = at(&output, 5, 8)[3];
+        assert!(edge as i32 > glass && edge < 255, "text edge blends, alpha {edge}");
+
+        let mut changed = Vec::new();
+        for y in 17..33 {
+            for x in (7..19).chain(28..42) {
+                if at(&output, x, y) != at(&input, x, y) {
+                    changed.push((x, y, at(&input, x, y), at(&output, x, y)));
+                }
+            }
+        }
+        assert!(changed.is_empty(), "image pixels changed: {changed:?}");
+    }
+
+    #[test]
+    fn without_a_background_color_the_app_is_unchanged() {
+        let Ok(renderer) = Renderer::new() else { return };
+        let input = scene();
+        assert_eq!(render_on_gpu(&renderer, &input, None), input);
     }
 }

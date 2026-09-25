@@ -60,9 +60,9 @@ Apps running as administrator can only be frosted when Blurman runs as administr
 
 ### Solid text
 
-With **Solid text** on, Blurman hides the real app (it stays at alpha 1, so it still gets every click and key) and shows a live copy of it on the glass instead. The copy comes from Windows Graphics Capture. A small GPU shader finds the app's background color and makes only that color see-through, so text, icons, and images stay at full strength.
+With **Solid text** on, Blurman hides the real app (it stays at alpha 1, so it still gets every click and key) and shows a live copy of it on the glass instead. The copy comes from Windows Graphics Capture. A small GPU shader finds the app's flat background color and turns only solid patches of exactly that color into glass, blending the edges of text into it. Everything else, including images and video, is drawn exactly as the app drew it, even where it happens to be close to the background color.
 
-It costs a few percent of one CPU thread and about 40 MB of GPU memory per app. The copy trails the real app by about one frame. Protected video (DRM) shows as black, as in any screen capture. Apps with a busy or gradient background get less glass, because only a single flat background color is keyed out.
+It costs a few percent of one CPU thread and about 40 MB of GPU memory per app. The copy trails the real app by about one frame. Protected video (DRM) shows as black, as in any screen capture. Backgrounds that are a gradient, a picture, or translucent get no glass, and while an app shows no clear background color at all, such as a fullscreen video, it is drawn unchanged.
 
 While a fullscreen game or presentation is in front, solid text falls back to the normal fade so it never competes with the game for the GPU. **Keep solid text during fullscreen games** in Settings turns that off.
 

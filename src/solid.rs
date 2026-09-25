@@ -21,13 +21,15 @@ use windows::Win32::Graphics::Direct3D::{
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
     ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
-    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_BUFFER_DESC,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_FLAG, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE, D3D11_USAGE_DEFAULT,
     D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
@@ -60,9 +62,20 @@ const MATCH_TOLERANCE: f32 = 0.5 / 255.0;
 /// Matching pixels out of the 5x5 around one before it counts as background. Photos and video
 /// only hit the key color in stray pixels, so they stay solid.
 const PATCH_MIN: f32 = 8.0;
+/// Pixels are grouped into square blocks this wide to find which patches of background color
+/// are connected to each other. Keep in sync with `BLOCK` in the shader.
+const BLOCK: u32 = 4;
+/// Matching pixels out of a block's 16 before it can join the background. Half a block lets
+/// the background reach across text strokes but not across the thicker content of images.
+const BLOCK_MIN: u8 = 8;
+/// Enclosed patches smaller than this many blocks, like the inside of letters, still count as
+/// background. Bigger enclosed patches are part of an image and stay solid.
+const SMALL_PATCH: usize = 16;
 
 const SHADER: &str = r#"
+static const int BLOCK = 4;
 Texture2D frame : register(t0);
+Texture2D<float> background : register(t1);  // 1 for blocks of the app's background
 cbuffer Params : register(b0) {
     float4 key;    // rgb: background color, a: 1 when the app has one
     float4 extra;  // x: background opacity, y: solid threshold, z: match tolerance, w: patch minimum
@@ -79,6 +92,23 @@ float4 pixel_at(int2 at) {
     return frame.Load(int3(at, 0));
 }
 
+uint matches(int2 at) {
+    float4 q = pixel_at(at);
+    return q.a > 0.99 && all(abs(q.rgb - key.rgb) <= extra.z) ? 1 : 0;
+}
+
+// Number of pixels matching the background color in each block, read back by the CPU.
+float ps_count(float4 pos : SV_Position) : SV_Target {
+    int2 origin = int2(pos.xy) * BLOCK;
+    uint count = 0;
+    [unroll] for (int y = 0; y < BLOCK; y++) {
+        [unroll] for (int x = 0; x < BLOCK; x++) {
+            count += matches(origin + int2(x, y));
+        }
+    }
+    return count / 255.0;
+}
+
 float4 ps_main(float4 pos : SV_Position) : SV_Target {
     int2 at = int2(pos.xy);
     float4 p = pixel_at(at);
@@ -87,8 +117,8 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
     uint match[7][7];
     [unroll] for (int y = 0; y < 7; y++) {
         [unroll] for (int x = 0; x < 7; x++) {
-            float4 q = pixel_at(at + int2(x - 3, y - 3));
-            match[y][x] = q.a > 0.99 && all(abs(q.rgb - key.rgb) <= extra.z) ? 1 : 0;
+            int2 q = at + int2(x - 3, y - 3);
+            match[y][x] = matches(q) * (background.Load(int3(q / BLOCK, 0)) > 0.5 ? 1 : 0);
         }
     }
     // Only this pixel and its neighbors can turn to glass, and only when they sit in a patch of
@@ -138,6 +168,7 @@ pub struct Renderer {
     factory: IDXGIFactory2,
     vertex: ID3D11VertexShader,
     pixel: ID3D11PixelShader,
+    count: ID3D11PixelShader,
     params: ID3D11Buffer,
 }
 
@@ -180,6 +211,10 @@ impl Renderer {
             device
                 .CreatePixelShader(&compile(s!("ps_main"), s!("ps_5_0"))?, None, Some(&mut pixel))
                 .map_err(err("Pixel shader"))?;
+            let mut count = None;
+            device
+                .CreatePixelShader(&compile(s!("ps_count"), s!("ps_5_0"))?, None, Some(&mut count))
+                .map_err(err("Pixel shader"))?;
             let mut params = None;
             device
                 .CreateBuffer(
@@ -200,51 +235,218 @@ impl Renderer {
                 factory,
                 vertex: vertex.ok_or("No vertex shader.")?,
                 pixel: pixel.ok_or("No pixel shader.")?,
+                count: count.ok_or("No pixel shader.")?,
                 params: params.ok_or("No shader parameters.")?,
             })
         }
     }
 
-    /// Draw `source` into `target` with the background color keyed out. Without a background
-    /// color the app is drawn unchanged.
+    /// Draw `source` into `target` with the background color keyed out, turning only the
+    /// blocks marked in `background` to glass. Without a background color the app is drawn
+    /// unchanged.
     fn render(
         &self,
         source: &ID3D11ShaderResourceView,
+        background: Option<&ID3D11ShaderResourceView>,
         target: &ID3D11RenderTargetView,
         size: SizeInt32,
-        content: SizeInt32,
-        key: Option<[u8; 3]>,
-        background_alpha: f32,
+        params: &Params,
     ) {
-        let [r, g, b] = key.unwrap_or_default().map(|channel| channel as f32 / 255.0);
-        let params = Params {
-            key: [r, g, b, if key.is_some() { 1.0 } else { 0.0 }],
-            extra: [background_alpha, SOLID_AT, MATCH_TOLERANCE, PATCH_MIN],
-            area: [content.Width as f32, content.Height as f32, 0.0, 0.0],
-        };
+        let sources = [Some(source.clone()), background.cloned()];
+        self.pass(&self.pixel, &sources, target, (size.Width as u32, size.Height as u32), params);
+    }
+
+    fn pass(
+        &self,
+        shader: &ID3D11PixelShader,
+        sources: &[Option<ID3D11ShaderResourceView>],
+        target: &ID3D11RenderTargetView,
+        (width, height): (u32, u32),
+        params: &Params,
+    ) {
         let context = &self.context;
         unsafe {
-            context.UpdateSubresource(&self.params, 0, None, (&raw const params).cast(), 0, 0);
+            context.UpdateSubresource(&self.params, 0, None, std::ptr::from_ref(params).cast(), 0, 0);
             context.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
             context.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
-                Width: size.Width as f32,
-                Height: size.Height as f32,
+                Width: width as f32,
+                Height: height as f32,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
             context.IASetInputLayout(None);
             context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.VSSetShader(&self.vertex, None);
-            context.PSSetShader(&self.pixel, None);
+            context.PSSetShader(shader, None);
             context.PSSetConstantBuffers(0, Some(&[Some(self.params.clone())]));
-            context.PSSetShaderResources(0, Some(&[Some(source.clone())]));
+            context.PSSetShaderResources(0, Some(sources));
             context.Draw(3, 0);
-            context.PSSetShaderResources(0, Some(&[None]));
+            context.PSSetShaderResources(0, Some(&vec![None; sources.len()]));
             context.OMSetRenderTargets(None, None);
         }
     }
+}
+
+fn params(content: SizeInt32, key: Option<[u8; 3]>, background_alpha: f32) -> Params {
+    let [r, g, b] = key.unwrap_or_default().map(|channel| channel as f32 / 255.0);
+    Params {
+        key: [r, g, b, if key.is_some() { 1.0 } else { 0.0 }],
+        extra: [background_alpha, SOLID_AT, MATCH_TOLERANCE, PATCH_MIN],
+        area: [content.Width as f32, content.Height as f32, 0.0, 0.0],
+    }
+}
+
+fn texture(
+    renderer: &Renderer,
+    (width, height): (u32, u32),
+    format: DXGI_FORMAT,
+    usage: D3D11_USAGE,
+    bind: D3D11_BIND_FLAG,
+) -> Result<ID3D11Texture2D, String> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: usage,
+        BindFlags: bind.0 as u32,
+        CPUAccessFlags: if usage == D3D11_USAGE_STAGING { D3D11_CPU_ACCESS_READ.0 as u32 } else { 0 },
+        ..Default::default()
+    };
+    let mut texture = None;
+    unsafe { renderer.device.CreateTexture2D(&desc, None, Some(&mut texture)) }.map_err(err("Texture"))?;
+    texture.ok_or_else(|| "No texture.".into())
+}
+
+/// Which parts of a frame are the app's own background, as opposed to patches of the same
+/// color inside an image or video. The GPU counts matching pixels per block, and the blocks
+/// are grouped into connected patches on the CPU.
+struct Regions {
+    content: SizeInt32,
+    blocks: (u32, u32),
+    counts: ID3D11Texture2D,
+    counts_target: ID3D11RenderTargetView,
+    staging: ID3D11Texture2D,
+    mask: ID3D11Texture2D,
+    mask_view: ID3D11ShaderResourceView,
+}
+
+impl Regions {
+    fn new(renderer: &Renderer, content: SizeInt32) -> Result<Self, String> {
+        let blocks = (
+            (content.Width as u32).div_ceil(BLOCK).max(1),
+            (content.Height as u32).div_ceil(BLOCK).max(1),
+        );
+        let counts = texture(renderer, blocks, DXGI_FORMAT_R8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET)?;
+        let staging = texture(renderer, blocks, DXGI_FORMAT_R8_UNORM, D3D11_USAGE_STAGING, D3D11_BIND_FLAG(0))?;
+        let mask = texture(renderer, blocks, DXGI_FORMAT_R8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE)?;
+        let (mut counts_target, mut mask_view) = (None, None);
+        unsafe {
+            renderer
+                .device
+                .CreateRenderTargetView(&counts, None, Some(&mut counts_target))
+                .map_err(err("Render target"))?;
+            renderer.device.CreateShaderResourceView(&mask, None, Some(&mut mask_view)).map_err(err("Mask view"))?;
+        }
+        Ok(Self {
+            content,
+            blocks,
+            counts,
+            counts_target: counts_target.ok_or("No render target.")?,
+            staging,
+            mask,
+            mask_view: mask_view.ok_or("No mask view.")?,
+        })
+    }
+
+    fn update(&self, renderer: &Renderer, source: &ID3D11ShaderResourceView, key: [u8; 3]) -> Result<(), String> {
+        let (width, height) = (self.blocks.0 as usize, self.blocks.1 as usize);
+        let params = params(self.content, Some(key), 0.0);
+        renderer.pass(&renderer.count, &[Some(source.clone())], &self.counts_target, self.blocks, &params);
+        let mut counts = Vec::with_capacity(width * height);
+        unsafe {
+            renderer.context.CopyResource(&self.staging, &self.counts);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            renderer
+                .context
+                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(err("Reading the frame"))?;
+            for row in 0..height {
+                let line = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
+                counts.extend_from_slice(std::slice::from_raw_parts(line, width));
+            }
+            renderer.context.Unmap(&self.staging, 0);
+            let mask = background_blocks(&counts, width, height);
+            renderer.context.UpdateSubresource(&self.mask, 0, None, mask.as_ptr().cast(), width as u32, 0);
+        }
+        Ok(())
+    }
+}
+
+/// Which blocks belong to the app's background, given how many pixels in each block match the
+/// background color. Blocks with enough matches are grouped into connected patches. The
+/// biggest patch is the background, along with any touching the edge of the window (split
+/// panes) and any too small to be more than the inside of a letter. Patches enclosed by other
+/// content, like a flat area inside an image, are not. Kept patches grow by one block so the
+/// text and image edges along them can blend. Returns 255 for background blocks, 0 otherwise.
+pub fn background_blocks(counts: &[u8], width: usize, height: usize) -> Vec<u8> {
+    const NONE: u32 = u32::MAX;
+    let open: Vec<bool> = counts.iter().map(|&count| count >= BLOCK_MIN).collect();
+    let mut label = vec![NONE; counts.len()];
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut edges: Vec<bool> = Vec::new();
+    let mut stack = Vec::new();
+    for start in 0..counts.len() {
+        if !open[start] || label[start] != NONE {
+            continue;
+        }
+        let id = sizes.len() as u32;
+        let (mut size, mut edge) = (0, false);
+        label[start] = id;
+        stack.push(start);
+        while let Some(i) = stack.pop() {
+            size += 1;
+            let (x, y) = (i % width, i / width);
+            edge |= x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+            let neighbors = [
+                (x > 0).then(|| i - 1),
+                (x + 1 < width).then(|| i + 1),
+                (y > 0).then(|| i - width),
+                (y + 1 < height).then(|| i + width),
+            ];
+            for j in neighbors.into_iter().flatten() {
+                if open[j] && label[j] == NONE {
+                    label[j] = id;
+                    stack.push(j);
+                }
+            }
+        }
+        sizes.push(size);
+        edges.push(edge);
+    }
+    let biggest = sizes.iter().copied().max().unwrap_or(0);
+    let keep: Vec<bool> = sizes
+        .iter()
+        .zip(&edges)
+        .map(|(&size, &edge)| size == biggest || edge || size < SMALL_PATCH)
+        .collect();
+    let kept = |x: usize, y: usize| label[y * width + x] != NONE && keep[label[y * width + x] as usize];
+
+    let mut mask = vec![0u8; counts.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let near = (y.saturating_sub(1)..=(y + 1).min(height - 1))
+                .any(|ny| (x.saturating_sub(1)..=(x + 1).min(width - 1)).any(|nx| kept(nx, ny)));
+            if near {
+                mask[y * width + x] = 255;
+            }
+        }
+    }
+    mask
 }
 
 fn compile(entry: PCSTR, target: PCSTR) -> Result<Vec<u8>, String> {
@@ -295,6 +497,7 @@ pub struct SolidView {
     staging: Option<(ID3D11Texture2D, u32)>,
     key: Option<[u8; 3]>,
     keyed_at: Option<Instant>,
+    regions: Option<Regions>,
 }
 
 impl SolidView {
@@ -361,6 +564,7 @@ impl SolidView {
                 staging: None,
                 key: None,
                 keyed_at: None,
+                regions: None,
             },
             surface,
         ))
@@ -376,6 +580,7 @@ impl SolidView {
         let Some((_, view, content)) = &self.last else {
             return Ok(false);
         };
+        let (view, content) = (view.clone(), *content);
         if self.target_view.is_none() {
             let back: ID3D11Texture2D = unsafe { self.swapchain.GetBuffer(0) }.map_err(err("Back buffer"))?;
             let mut target_view = None;
@@ -383,8 +588,19 @@ impl SolidView {
                 .map_err(err("Render target"))?;
             self.target_view = target_view;
         }
+        if let Some(key) = self.key {
+            let stale = self.regions.as_ref().is_none_or(|regions| regions.content != content);
+            if stale {
+                self.regions = Some(Regions::new(renderer, content)?);
+            }
+            if let Some(regions) = self.regions.as_ref().filter(|_| fresh || stale) {
+                regions.update(renderer, &view, key)?;
+            }
+        }
         let target = self.target_view.as_ref().ok_or("No render target.")?;
-        renderer.render(view, target, self.size, *content, self.key, background_alpha);
+        let background = self.regions.as_ref().map(|regions| &regions.mask_view);
+        let params = params(content, self.key, background_alpha);
+        renderer.render(&view, background, target, self.size, &params);
         unsafe { self.swapchain.Present(0, DXGI_PRESENT(0)) }.ok().map_err(err("Present"))?;
         Ok(true)
     }
@@ -580,13 +796,14 @@ mod tests {
         assert_eq!(background_color(&pixels), None);
     }
 
-    const W: u32 = 48;
-    const H: u32 = 40;
+    const W: u32 = 96;
+    const H: u32 = 72;
     const KEY: [u8; 3] = [31, 31, 31];
     const ALPHA: f32 = 0.7;
 
     /// Dark theme background with a text stroke, a noisy dark photo that often hits the
-    /// background color exactly, and a bright image.
+    /// background color exactly, and a bright image with a flat area of exactly the background
+    /// color inside it.
     fn scene() -> Vec<u8> {
         let mut pixels = Vec::new();
         for y in 0..H {
@@ -595,12 +812,14 @@ mod tests {
                     [220, 220, 220]
                 } else if (4..12).contains(&y) && x == 5 {
                     [80, 80, 80]
-                } else if (14..36).contains(&y) && (4..22).contains(&x) {
+                } else if (20..64).contains(&y) && (4..36).contains(&x) {
                     let noise = (x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663)) % 11;
                     let v = 26 + noise as u8;
                     [v, v, v]
-                } else if (14..36).contains(&y) && (26..44).contains(&x) {
-                    [200, (x * 5) as u8, (y * 6) as u8]
+                } else if (24..60).contains(&y) && (52..84).contains(&x) {
+                    KEY
+                } else if (16..68).contains(&y) && (44..92).contains(&x) {
+                    [200, (x * 2) as u8, (y * 3) as u8]
                 } else {
                     KEY
                 };
@@ -644,7 +863,13 @@ mod tests {
             device.CreateTexture2D(&staging_desc, None, Some(&mut staging)).unwrap();
             let staging = staging.unwrap();
 
-            renderer.render(view.as_ref().unwrap(), target_view.as_ref().unwrap(), size, size, key, ALPHA);
+            let view = view.unwrap();
+            let regions = Regions::new(renderer, size).unwrap();
+            if let Some(key) = key {
+                regions.update(renderer, &view, key).unwrap();
+            }
+            let background = Some(&regions.mask_view);
+            renderer.render(&view, background, target_view.as_ref().unwrap(), size, &params(size, key, ALPHA));
             renderer.context.CopyResource(&staging, &target);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             renderer.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).unwrap();
@@ -673,7 +898,7 @@ mod tests {
         let output = render_on_gpu(&renderer, &input, Some(KEY));
 
         let glass = (ALPHA * 255.0).round() as i32;
-        let [b, _, _, a] = at(&output, 30, 4);
+        let [b, _, _, a] = at(&output, 60, 4);
         assert!((a as i32 - glass).abs() <= 1, "background alpha {a}");
         assert!((b as i32 - (31.0 * ALPHA) as i32).abs() <= 1, "background color {b}");
 
@@ -682,8 +907,8 @@ mod tests {
         assert!(edge as i32 > glass && edge < 255, "text edge blends, alpha {edge}");
 
         let mut changed = Vec::new();
-        for y in 17..33 {
-            for x in (7..19).chain(28..42) {
+        for y in 18..66 {
+            for x in (7..33).filter(|_| (23..61).contains(&y)).chain(46..90) {
                 if at(&output, x, y) != at(&input, x, y) {
                     changed.push((x, y, at(&input, x, y), at(&output, x, y)));
                 }
@@ -697,5 +922,37 @@ mod tests {
         let Ok(renderer) = Renderer::new() else { return };
         let input = scene();
         assert_eq!(render_on_gpu(&renderer, &input, None), input);
+    }
+
+    /// A grid of blocks that all match, with `holes` cleared.
+    fn blocks(width: usize, height: usize, holes: impl Fn(usize, usize) -> bool) -> Vec<u8> {
+        (0..width * height)
+            .map(|i| if holes(i % width, i / width) { 0 } else { BLOCK as u8 * BLOCK as u8 })
+            .collect()
+    }
+
+    #[test]
+    fn enclosed_patches_are_not_background() {
+        let ring = |x: usize, y: usize| {
+            (2..=11).contains(&x) && (2..=9).contains(&y) && (x == 2 || x == 11 || y == 2 || y == 9)
+        };
+        let mask = background_blocks(&blocks(14, 12, ring), 14, 12);
+        let at = |x: usize, y: usize| mask[y * 14 + x];
+        assert_eq!(at(0, 0), 255, "outside is background");
+        assert_eq!(at(2, 5), 255, "the ring's outer edge can blend");
+        assert_eq!(at(3, 3), 0, "inside the ring is not");
+        assert_eq!(at(6, 6), 0);
+    }
+
+    #[test]
+    fn letter_holes_and_edge_panes_are_background() {
+        let letter = |x: usize, y: usize| (5..=7).contains(&x) && (5..=7).contains(&y) && (x, y) != (6, 6);
+        let mask = background_blocks(&blocks(14, 12, letter), 14, 12);
+        assert_eq!(mask[6 * 14 + 6], 255, "inside of a letter");
+
+        let divider = |x: usize, _: usize| x == 4 || x == 5;
+        let mask = background_blocks(&blocks(14, 12, divider), 14, 12);
+        assert_eq!(mask[6 * 14 + 1], 255, "the smaller pane touching the edge");
+        assert_eq!(mask[6 * 14 + 10], 255);
     }
 }

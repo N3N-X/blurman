@@ -10,7 +10,8 @@ Frosted glass behind the Windows apps you pick. Chrome, Edge, Electron apps, Not
 
 - Pick any running app, set **transparency** and **blur**, and press **Frost it**. Sliders apply live.
 - Rules are saved per app and come back on every new window of that app.
-- **Solid text** (experimental, per app) turns only the app's background to glass and keeps text and images fully solid. See [Solid text](#solid-text).
+- **Solid text** (experimental, per app) turns only the app's background to glass and keeps text and images fully solid. Switch it on or off right on each saved rule. See [Solid text](#solid-text).
+- On Windows 11 the Blurman window is frosted glass itself, using the system acrylic backdrop.
 - **Pause** puts every app back without deleting rules. **Restore all** deletes them.
 - **Start with Windows** runs Blurman quietly in the tray at sign-in. **Keep in tray on close** does the same for normal launches, so apps stay frosted while the window is closed.
 - Glass follows the app as you move, resize, minimize, or switch virtual desktops.
@@ -60,7 +61,9 @@ Apps running as administrator can only be frosted when Blurman runs as administr
 
 ### Solid text
 
-With **Solid text** on, Blurman hides the real app (it stays at alpha 1, so it still gets every click and key) and shows a live copy of it on the glass instead. The copy comes from Windows Graphics Capture. A small GPU shader finds the app's flat background color and turns only solid patches of exactly that color into glass, blending the edges of text into it. Everything else, including images and video, is drawn exactly as the app drew it, even where it happens to be close to the background color.
+With **Solid text** on, Blurman hides the real app (it stays at alpha 1, so it still gets every click and key) and shows a live copy of it on the glass instead. The copy comes from Windows Graphics Capture. A small GPU shader finds the app's flat background color and turns only patches of exactly that color into glass, blending the edges of text into it. Blurman then keeps only the patches connected to the app's main background (or touching the window edge), so a flat area of the same color inside an image or video, with image content around it, stays solid. Everything else is drawn exactly as the app drew it.
+
+One case cannot be told apart: an image whose flat background runs straight into the page with no edge in between, such as a white-background picture on a white page. That part of the image turns to glass along with the page.
 
 It costs a few percent of one CPU thread and about 40 MB of GPU memory per app. The copy trails the real app by about one frame. Protected video (DRM) shows as black, as in any screen capture. Backgrounds that are a gradient, a picture, or translucent get no glass, and while an app shows no clear background color at all, such as a fullscreen video, it is drawn unchanged.
 

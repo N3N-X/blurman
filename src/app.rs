@@ -6,14 +6,20 @@ use crate::mapping::{self, BLUR_DEFAULT, TRANSPARENCY_DEFAULT};
 use crate::rules::{self, Rule, Settings, Store};
 use crate::shared::Shared;
 use crate::target::{self, AppGroup};
-use crate::theme::{self, ACCENT, CARD_STROKE, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, WARN};
+use crate::theme::{self, ACCENT, CARD_STROKE, MUTED, ROW, ROW_HOVER, ROW_SELECTED, TEXT, WARN};
 use crate::tray;
 use egui::{Align, Color32, CursorIcon, Frame, Layout, Margin, RichText, Sense, Shape, Slider, Ui};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Dwm::{
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
+};
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Controls::MARGINS;
 
 const RESCAN: Duration = Duration::from_secs(1);
 
@@ -45,6 +51,7 @@ fn open_window(shared: &Arc<Shared>, tray_session: bool) -> Result<(), String> {
             .with_title("Blurman")
             .with_inner_size([560.0, 800.0])
             .with_min_inner_size([480.0, 600.0])
+            .with_transparent(true)
             .with_icon(icon_rgba()),
         ..Default::default()
     };
@@ -55,18 +62,32 @@ fn open_window(shared: &Arc<Shared>, tray_session: bool) -> Result<(), String> {
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             app_shared.set_ctx(Some(cc.egui_ctx.clone()));
+            let mut glass = false;
             if let Ok(handle) = cc.window_handle() {
                 if let RawWindowHandle::Win32(win32) = handle.as_raw() {
                     app_shared.main_window.store(win32.hwnd.get(), Ordering::SeqCst);
+                    glass = frost_window(HWND(win32.hwnd.get() as *mut _));
                 }
             }
-            Ok(Box::new(BlurmanApp::new(app_shared, settings, tray_session)))
+            Ok(Box::new(BlurmanApp::new(app_shared, settings, tray_session, glass)))
         }),
     )
     .map_err(|err| err.to_string());
     shared.main_window.store(0, Ordering::SeqCst);
     shared.set_ctx(None);
     result
+}
+
+/// Give the window the Windows 11 acrylic backdrop, so Blurman itself is frosted glass.
+/// False on Windows versions without system backdrops, where the window stays opaque.
+fn frost_window(hwnd: HWND) -> bool {
+    let set = |attribute: DWMWINDOWATTRIBUTE, value: i32| unsafe {
+        DwmSetWindowAttribute(hwnd, attribute, (&raw const value).cast(), size_of::<i32>() as u32)
+    };
+    let _ = set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
+    let margins = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+    unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }.is_ok()
+        && set(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW.0).is_ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,10 +112,12 @@ struct BlurmanApp {
     solid_text: bool,
     /// Launched by Windows startup: this session lives in the tray whatever the setting says.
     startup: bool,
+    /// The window has a frosted backdrop showing through wherever nothing is drawn.
+    glass: bool,
 }
 
 impl BlurmanApp {
-    fn new(shared: Arc<Shared>, settings: Settings, startup: bool) -> Self {
+    fn new(shared: Arc<Shared>, settings: Settings, startup: bool, glass: bool) -> Self {
         let store = rules::load();
         let tray_error = tray::sync(settings.close_to_tray || startup, store.paused).err();
         Self {
@@ -112,6 +135,7 @@ impl BlurmanApp {
             blur: BLUR_DEFAULT,
             solid_text: false,
             startup,
+            glass,
         }
     }
 
@@ -268,8 +292,8 @@ impl BlurmanApp {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for group in &self.groups {
                         let selected = self.selected.as_deref() == Some(group.process.as_str());
-                        let frosted = self.store.rule(&group.process).is_some_and(|rule| rule.enabled);
-                        if app_row(ui, group, selected, frosted).clicked() {
+                        let rule = self.store.rule(&group.process).filter(|rule| rule.enabled);
+                        if app_row(ui, group, selected, rule).clicked() {
                             picked = Some(group.process.clone());
                         }
                     }
@@ -379,7 +403,8 @@ impl BlurmanApp {
             ui.add_space(2.0);
             for rule in &mut self.store.rules {
                 Frame::new()
-                    .fill(ROW_HOVER)
+                    .fill(ROW)
+                    .stroke(theme::line(1.0, CARD_STROKE))
                     .corner_radius(10)
                     .inner_margin(Margin::symmetric(12, 10))
                     .show(ui, |ui| {
@@ -394,9 +419,14 @@ impl BlurmanApp {
                                 if ui.add(theme::danger_button("Remove").small()).clicked() {
                                     delete = Some(rule.process.clone());
                                 }
-                                if rule.solid_text {
-                                    theme::badge(ui, "Solid text", ACCENT);
-                                }
+                                ui.add_space(6.0);
+                                changed |= theme::toggle(ui, &mut rule.solid_text)
+                                    .on_hover_text(
+                                        "Only the background turns to glass; text and images stay solid.",
+                                    )
+                                    .changed();
+                                let color = if rule.solid_text { ACCENT } else { MUTED };
+                                ui.label(RichText::new("Solid text").small().color(color));
                             });
                         });
                         ui.horizontal(|ui| {
@@ -514,6 +544,15 @@ impl BlurmanApp {
 }
 
 impl eframe::App for BlurmanApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.glass {
+            // A light dark tint over the acrylic keeps text readable on bright wallpapers.
+            [0.0, 0.0, 0.0, 0.28]
+        } else {
+            theme::BG.to_normalized_gamma_f32()
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(RESCAN);
         if ctx.input(|input| input.viewport().close_requested()) && self.keeps_in_tray() {
@@ -527,7 +566,7 @@ impl eframe::App for BlurmanApp {
             self.tray_error = tray::sync(true, self.store.paused).err();
         }
 
-        let panel = |margin: Margin| Frame::new().fill(theme::BG).inner_margin(margin);
+        let panel = |margin: Margin| Frame::new().inner_margin(margin);
         egui::TopBottomPanel::top("header")
             .frame(panel(Margin { left: 18, right: 18, top: 14, bottom: 10 }))
             .show_separator_line(false)
@@ -571,7 +610,7 @@ fn banner(ui: &mut Ui, color: Color32, add_contents: impl FnOnce(&mut Ui)) {
     ui.add_space(4.0);
 }
 
-fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, frosted: bool) -> egui::Response {
+fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -> egui::Response {
     let background = ui.painter().add(Shape::Noop);
     let inner = Frame::new()
         .inner_margin(Margin::symmetric(10, 6))
@@ -593,8 +632,8 @@ fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, frosted: bool) -> egui
                         if group.windows == 1 { "" } else { "s" }
                     );
                     ui.label(theme::muted(count).small());
-                    if frosted {
-                        theme::badge(ui, "Frosted", ACCENT);
+                    if let Some(rule) = rule {
+                        theme::badge(ui, if rule.solid_text { "Frosted · solid text" } else { "Frosted" }, ACCENT);
                     }
                     if group.elevated {
                         theme::badge(ui, "Admin", WARN);

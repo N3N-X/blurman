@@ -5,17 +5,27 @@ use egui::{
     TextStyle, Ui, Vec2,
 };
 
+// Surfaces are translucent white or accent laid over the window's frosted backdrop. Colors
+// are premultiplied, so the channels of a translucent color never exceed its alpha.
 pub const ACCENT: Color32 = Color32::from_rgb(125, 196, 255);
 pub const ACCENT_DIM: Color32 = Color32::from_rgb(58, 104, 150);
+/// Behind everything when Windows cannot frost the window.
 pub const BG: Color32 = Color32::from_rgb(16, 18, 23);
-pub const CARD: Color32 = Color32::from_rgb(25, 28, 35);
-pub const CARD_STROKE: Color32 = Color32::from_rgb(39, 43, 53);
-pub const ROW_HOVER: Color32 = Color32::from_rgb(33, 37, 46);
-pub const ROW_SELECTED: Color32 = Color32::from_rgb(33, 52, 72);
-pub const TEXT: Color32 = Color32::from_rgb(228, 232, 240);
-pub const MUTED: Color32 = Color32::from_rgb(138, 146, 162);
+/// Tooltips and menus, which float over content and need to stay readable.
+pub const POPUP: Color32 = Color32::from_rgb(30, 33, 41);
+pub const CARD: Color32 = white(14);
+pub const CARD_STROKE: Color32 = white(24);
+pub const ROW: Color32 = white(10);
+pub const ROW_HOVER: Color32 = white(20);
+pub const ROW_SELECTED: Color32 = Color32::from_rgba_premultiplied(29, 46, 60, 60);
+pub const TEXT: Color32 = Color32::from_rgb(236, 240, 247);
+pub const MUTED: Color32 = Color32::from_rgb(160, 168, 184);
 pub const WARN: Color32 = Color32::from_rgb(240, 190, 110);
 pub const DANGER: Color32 = Color32::from_rgb(235, 120, 120);
+
+const fn white(alpha: u8) -> Color32 {
+    Color32::from_rgba_premultiplied(alpha, alpha, alpha, alpha)
+}
 
 pub fn line(width: f32, color: Color32) -> Stroke {
     Stroke::new(width, color)
@@ -25,10 +35,11 @@ pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
     let visuals = &mut style.visuals;
-    visuals.panel_fill = BG;
-    visuals.window_fill = CARD;
+    visuals.panel_fill = Color32::TRANSPARENT;
+    visuals.window_fill = POPUP;
+    visuals.window_stroke = line(1.0, CARD_STROKE);
     visuals.faint_bg_color = CARD;
-    visuals.extreme_bg_color = Color32::from_rgb(11, 13, 17);
+    visuals.extreme_bg_color = Color32::from_rgba_premultiplied(0, 0, 0, 90);
     visuals.hyperlink_color = ACCENT;
     visuals.slider_trailing_fill = true;
     visuals.window_corner_radius = CornerRadius::same(12);
@@ -47,15 +58,15 @@ pub fn apply(ctx: &egui::Context) {
     }
     widgets.noninteractive.fg_stroke = line(1.0, TEXT);
     widgets.noninteractive.bg_stroke = line(1.0, CARD_STROKE);
-    widgets.inactive.weak_bg_fill = Color32::from_rgb(38, 42, 52);
-    widgets.inactive.bg_fill = Color32::from_rgb(44, 49, 61);
+    widgets.inactive.weak_bg_fill = white(22);
+    widgets.inactive.bg_fill = white(30);
     widgets.inactive.bg_stroke = Stroke::NONE;
     widgets.inactive.fg_stroke = line(1.0, TEXT);
-    widgets.hovered.weak_bg_fill = Color32::from_rgb(50, 56, 70);
-    widgets.hovered.bg_fill = Color32::from_rgb(56, 63, 78);
+    widgets.hovered.weak_bg_fill = white(34);
+    widgets.hovered.bg_fill = white(42);
     widgets.hovered.bg_stroke = line(1.0, ACCENT_DIM);
     widgets.hovered.fg_stroke = line(1.5, Color32::WHITE);
-    widgets.active.weak_bg_fill = Color32::from_rgb(60, 68, 86);
+    widgets.active.weak_bg_fill = white(48);
     widgets.active.bg_fill = ACCENT;
     widgets.active.bg_stroke = line(1.0, ACCENT);
     widgets.active.fg_stroke = line(2.0, Color32::WHITE);
@@ -137,11 +148,7 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     if ui.is_rect_visible(rect) {
         let how_on = ui.ctx().animate_bool(response.id, *on);
         let radius = 0.5 * rect.height();
-        let off = if response.hovered() {
-            Color32::from_rgb(66, 73, 90)
-        } else {
-            Color32::from_rgb(52, 58, 72)
-        };
+        let off = if response.hovered() { white(60) } else { white(42) };
         let track = lerp_color(off, ACCENT, how_on);
         ui.painter()
             .rect(rect, radius, track, Stroke::NONE, StrokeKind::Inside);
@@ -154,5 +161,5 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
 
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+    Color32::from_rgba_premultiplied(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()), mix(a.a(), b.a()))
 }

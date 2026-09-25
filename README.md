@@ -61,7 +61,7 @@ Apps running as administrator can only be frosted when Blurman runs as administr
 
 ### Solid text
 
-With **Solid text** on, Blurman hides the real app (it stays at alpha 1, so it still gets every click and key) and shows a live copy of it on the glass instead. The copy comes from Windows Graphics Capture. A small GPU shader finds the app's flat background color and turns only patches of exactly that color into glass, blending the edges of text into it. Blurman then keeps only the patches connected to the app's main background (or touching the window edge), so a flat area of the same color inside an image or video, with image content around it, stays solid. Everything else is drawn exactly as the app drew it.
+With **Solid text** on, Blurman hides the real app (it stays at alpha 1, so it still gets every click and key) and shows a live copy of it on the glass instead. The copy comes from Windows Graphics Capture. A small GPU shader turns only patches of the app's flat background colors into glass, blending the edges of text into them. Blurman finds up to four such colors, like a main pane and a sidebar in a different shade, by looking for colors that fill long runs, which text never does. Found colors are kept steady while you scroll. Only patches that belong to the app's layout turn to glass: the main background, panes touching the window edge, and other large panes. A flat area of one of those colors inside an image or video, with image content around it, stays solid. Everything else is drawn exactly as the app drew it.
 
 One case cannot be told apart: an image whose flat background runs straight into the page with no edge in between, such as a white-background picture on a white page. That part of the image turns to glass along with the page.
 

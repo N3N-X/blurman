@@ -19,7 +19,8 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     RegisterClassExW, SetTimer, TranslateMessage, CHILDID_SELF, EVENT_OBJECT_CLOAKED,
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_UNCLOAKED,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
+    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, MSG,
     OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
@@ -422,6 +423,24 @@ impl Engine {
                     tracked.follow(target::hwnd_of(*hwnd));
                 }
             }
+            // A new window of a ruled app is frosted the moment it appears, is restored, or gets
+            // its title, instead of on the next scan.
+            EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED | EVENT_OBJECT_NAMECHANGE | EVENT_SYSTEM_MINIMIZEEND
+                if !self.tracked.contains_key(&key) =>
+            {
+                if self.store.paused || self.refused.contains_key(&key) {
+                    return;
+                }
+                let ruled = target::frostable_process(hwnd).is_some_and(|process| {
+                    self.store
+                        .rules
+                        .iter()
+                        .any(|rule| rule.enabled && rule.process.eq_ignore_ascii_case(&process))
+                });
+                if ruled {
+                    self.reconcile();
+                }
+            }
             _ => {
                 if let Some(tracked) = self.tracked.get_mut(&key) {
                     tracked.follow(hwnd);
@@ -526,7 +545,7 @@ fn install_hooks() -> Vec<HWINEVENTHOOK> {
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
-        (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+        (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE),
         (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
     ];
     ranges

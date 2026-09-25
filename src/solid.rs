@@ -28,8 +28,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM,
-    DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8_UNORM,
+    DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
@@ -49,10 +49,21 @@ pub const WM_FRAME: u32 = WM_APP + 1;
 const FORMAT: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
 /// Apps change theme or scroll to a new page, so the background color is re-read this often.
 const KEY_EVERY: Duration = Duration::from_secs(1);
-/// Rows sampled across the window to find the background color.
+/// Rows sampled across the window to find the background colors.
 const KEY_ROWS: u32 = 9;
-/// The background must cover at least this share of the sampled pixels to be trusted.
+/// The main background must cover at least this share of the sampled pixels to be trusted.
 const KEY_MIN_SHARE: f32 = 0.2;
+/// Once found, the main background is kept until it drops below this share, so it does not
+/// flip back and forth as the app scrolls.
+const KEY_KEEP_SHARE: f32 = 0.1;
+/// Other flat colors, like a sidebar in a different shade, need this share of the samples in
+/// long runs, and are kept until they drop below the second value.
+const PANE_MIN_SHARE: f32 = 0.03;
+const PANE_KEEP_SHARE: f32 = 0.015;
+/// A run of one color must be at least this long to count as a pane. Text is never this long.
+const RUN_MIN: usize = 16;
+/// Background colors keyed out at once. Keep in sync with `MAX_KEYS` in the shader.
+const MAX_KEYS: usize = 4;
 /// How far from the background a pixel must be, as a fraction of the way to black or white,
 /// before it is drawn fully solid. Anti-aliased text edges fall between and blend smoothly.
 const SOLID_AT: f32 = 0.25;
@@ -69,17 +80,21 @@ const BLOCK: u32 = 4;
 /// the background reach across text strokes but not across the thicker content of images.
 const BLOCK_MIN: u8 = 8;
 /// Enclosed patches smaller than this many blocks, like the inside of letters, still count as
-/// background. Bigger enclosed patches are part of an image and stay solid.
+/// background.
 const SMALL_PATCH: usize = 16;
+/// Enclosed patches at least this share of the window are panes of the app and turn to glass.
+/// Smaller enclosed patches are part of an image and stay solid.
+const PANE_MIN_AREA: f32 = 0.05;
 
 const SHADER: &str = r#"
 static const int BLOCK = 4;
+static const int MAX_KEYS = 4;
 Texture2D frame : register(t0);
 Texture2D<float> background : register(t1);  // 1 for blocks of the app's background
 cbuffer Params : register(b0) {
-    float4 key;    // rgb: background color, a: 1 when the app has one
+    float4 keys[MAX_KEYS];  // background colors
     float4 extra;  // x: background opacity, y: solid threshold, z: match tolerance, w: patch minimum
-    float4 area;   // xy: content size in pixels
+    float4 area;   // xy: content size in pixels, z: number of background colors
 };
 
 float4 vs_main(uint id : SV_VertexID) : SV_Position {
@@ -92,51 +107,64 @@ float4 pixel_at(int2 at) {
     return frame.Load(int3(at, 0));
 }
 
-uint matches(int2 at) {
+// 1 + the index of the background color at this pixel, or 0 when it is not one.
+uint key_of(int2 at) {
     float4 q = pixel_at(at);
-    return q.a > 0.99 && all(abs(q.rgb - key.rgb) <= extra.z) ? 1 : 0;
+    uint found = 0;
+    [unroll] for (int k = MAX_KEYS - 1; k >= 0; k--) {
+        if (k < int(area.z) && q.a > 0.99 && all(abs(q.rgb - keys[k].rgb) <= extra.z)) found = k + 1;
+    }
+    return found;
 }
 
-// Number of pixels matching the background color in each block, read back by the CPU.
-float ps_count(float4 pos : SV_Position) : SV_Target {
+// For each block, how many pixels match its most common background color, and which color
+// that is. Read back by the CPU.
+float2 ps_count(float4 pos : SV_Position) : SV_Target {
     int2 origin = int2(pos.xy) * BLOCK;
-    uint count = 0;
+    uint counts[MAX_KEYS + 1] = { 0, 0, 0, 0, 0 };
     [unroll] for (int y = 0; y < BLOCK; y++) {
         [unroll] for (int x = 0; x < BLOCK; x++) {
-            count += matches(origin + int2(x, y));
+            counts[key_of(origin + int2(x, y))] += 1;
         }
     }
-    return count / 255.0;
+    uint best = 1;
+    [unroll] for (int k = 2; k <= MAX_KEYS; k++) {
+        if (counts[k] > counts[best]) best = k;
+    }
+    return float2(counts[best], best - 1) / 255.0;
 }
 
 float4 ps_main(float4 pos : SV_Position) : SV_Target {
     int2 at = int2(pos.xy);
     float4 p = pixel_at(at);
-    if (key.a == 0) return p;
+    if (area.z == 0) return p;
 
     uint match[7][7];
     [unroll] for (int y = 0; y < 7; y++) {
         [unroll] for (int x = 0; x < 7; x++) {
             int2 q = at + int2(x - 3, y - 3);
-            match[y][x] = matches(q) * (background.Load(int3(q / BLOCK, 0)) > 0.5 ? 1 : 0);
+            match[y][x] = background.Load(int3(q / BLOCK, 0)) > 0.5 ? key_of(q) : 0;
         }
     }
     // Only this pixel and its neighbors can turn to glass, and only when they sit in a patch of
-    // background, so the edge of text blends while everything else stays exactly as it was.
-    bool near_background = false;
+    // one background color, so the edge of text blends while everything else stays exactly as
+    // it was. The pixel's own color wins over a neighbor's.
+    uint near = 0;
     [unroll] for (int cy = 2; cy <= 4; cy++) {
         [unroll] for (int cx = 2; cx <= 4; cx++) {
+            uint m = match[cy][cx];
             uint count = 0;
             [unroll] for (int dy = -2; dy <= 2; dy++) {
                 [unroll] for (int dx = -2; dx <= 2; dx++) {
-                    count += match[cy + dy][cx + dx];
+                    count += match[cy + dy][cx + dx] == m ? 1 : 0;
                 }
             }
-            near_background = near_background || (match[cy][cx] == 1 && count >= extra.w);
+            if (m != 0 && count >= extra.w && (near == 0 || (cy == 3 && cx == 3))) near = m;
         }
     }
-    if (!near_background) return p;
+    if (near == 0) return p;
 
+    float3 key = keys[near - 1].rgb;
     float3 d = p.rgb - key.rgb;
     // How much of the way from the background toward black or white each channel moved.
     float3 room = max(d > 0 ? 1 - key.rgb : key.rgb, 1.0 / 255);
@@ -151,7 +179,7 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
 
 #[repr(C)]
 struct Params {
-    key: [f32; 4],
+    keys: [[f32; 4]; MAX_KEYS],
     extra: [f32; 4],
     area: [f32; 4],
 }
@@ -289,12 +317,17 @@ impl Renderer {
     }
 }
 
-fn params(content: SizeInt32, key: Option<[u8; 3]>, background_alpha: f32) -> Params {
-    let [r, g, b] = key.unwrap_or_default().map(|channel| channel as f32 / 255.0);
+fn params(content: SizeInt32, keys: &[[u8; 3]], background_alpha: f32) -> Params {
+    let keys = &keys[..keys.len().min(MAX_KEYS)];
+    let mut colors = [[0.0; 4]; MAX_KEYS];
+    for (color, key) in colors.iter_mut().zip(keys) {
+        let [r, g, b] = key.map(|channel| channel as f32 / 255.0);
+        *color = [r, g, b, 1.0];
+    }
     Params {
-        key: [r, g, b, if key.is_some() { 1.0 } else { 0.0 }],
+        keys: colors,
         extra: [background_alpha, SOLID_AT, MATCH_TOLERANCE, PATCH_MIN],
-        area: [content.Width as f32, content.Height as f32, 0.0, 0.0],
+        area: [content.Width as f32, content.Height as f32, keys.len() as f32, 0.0],
     }
 }
 
@@ -341,8 +374,8 @@ impl Regions {
             (content.Width as u32).div_ceil(BLOCK).max(1),
             (content.Height as u32).div_ceil(BLOCK).max(1),
         );
-        let counts = texture(renderer, blocks, DXGI_FORMAT_R8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET)?;
-        let staging = texture(renderer, blocks, DXGI_FORMAT_R8_UNORM, D3D11_USAGE_STAGING, D3D11_BIND_FLAG(0))?;
+        let counts = texture(renderer, blocks, DXGI_FORMAT_R8G8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET)?;
+        let staging = texture(renderer, blocks, DXGI_FORMAT_R8G8_UNORM, D3D11_USAGE_STAGING, D3D11_BIND_FLAG(0))?;
         let mask = texture(renderer, blocks, DXGI_FORMAT_R8_UNORM, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE)?;
         let (mut counts_target, mut mask_view) = (None, None);
         unsafe {
@@ -363,11 +396,12 @@ impl Regions {
         })
     }
 
-    fn update(&self, renderer: &Renderer, source: &ID3D11ShaderResourceView, key: [u8; 3]) -> Result<(), String> {
+    fn update(&self, renderer: &Renderer, source: &ID3D11ShaderResourceView, keys: &[[u8; 3]]) -> Result<(), String> {
         let (width, height) = (self.blocks.0 as usize, self.blocks.1 as usize);
-        let params = params(self.content, Some(key), 0.0);
+        let params = params(self.content, keys, 0.0);
         renderer.pass(&renderer.count, &[Some(source.clone())], &self.counts_target, self.blocks, &params);
         let mut counts = Vec::with_capacity(width * height);
+        let mut colors = Vec::with_capacity(width * height);
         unsafe {
             renderer.context.CopyResource(&self.staging, &self.counts);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -377,23 +411,27 @@ impl Regions {
                 .map_err(err("Reading the frame"))?;
             for row in 0..height {
                 let line = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
-                counts.extend_from_slice(std::slice::from_raw_parts(line, width));
+                for block in std::slice::from_raw_parts(line, width * 2).as_chunks::<2>().0 {
+                    counts.push(block[0]);
+                    colors.push(block[1]);
+                }
             }
             renderer.context.Unmap(&self.staging, 0);
-            let mask = background_blocks(&counts, width, height);
+            let mask = background_blocks(&counts, &colors, width, height);
             renderer.context.UpdateSubresource(&self.mask, 0, None, mask.as_ptr().cast(), width as u32, 0);
         }
         Ok(())
     }
 }
 
-/// Which blocks belong to the app's background, given how many pixels in each block match the
-/// background color. Blocks with enough matches are grouped into connected patches. The
-/// biggest patch is the background, along with any touching the edge of the window (split
-/// panes) and any too small to be more than the inside of a letter. Patches enclosed by other
+/// Which blocks belong to the app's background, given how many pixels in each block match its
+/// most common background color and which color that is. Neighboring blocks with enough
+/// matches of the same color are grouped into patches. The biggest patch is background, along
+/// with patches touching the edge of the window, patches big enough to be a pane, and patches
+/// too small to be more than the inside of a letter. Mid-sized patches enclosed by other
 /// content, like a flat area inside an image, are not. Kept patches grow by one block so the
 /// text and image edges along them can blend. Returns 255 for background blocks, 0 otherwise.
-pub fn background_blocks(counts: &[u8], width: usize, height: usize) -> Vec<u8> {
+pub fn background_blocks(counts: &[u8], colors: &[u8], width: usize, height: usize) -> Vec<u8> {
     const NONE: u32 = u32::MAX;
     let open: Vec<bool> = counts.iter().map(|&count| count >= BLOCK_MIN).collect();
     let mut label = vec![NONE; counts.len()];
@@ -419,7 +457,7 @@ pub fn background_blocks(counts: &[u8], width: usize, height: usize) -> Vec<u8> 
                 (y + 1 < height).then(|| i + width),
             ];
             for j in neighbors.into_iter().flatten() {
-                if open[j] && label[j] == NONE {
+                if open[j] && label[j] == NONE && colors[j] == colors[i] {
                     label[j] = id;
                     stack.push(j);
                 }
@@ -429,10 +467,11 @@ pub fn background_blocks(counts: &[u8], width: usize, height: usize) -> Vec<u8> 
         edges.push(edge);
     }
     let biggest = sizes.iter().copied().max().unwrap_or(0);
+    let pane = (counts.len() as f32 * PANE_MIN_AREA) as usize;
     let keep: Vec<bool> = sizes
         .iter()
         .zip(&edges)
-        .map(|(&size, &edge)| size == biggest || edge || size < SMALL_PATCH)
+        .map(|(&size, &edge)| size == biggest || edge || size >= pane || size < SMALL_PATCH)
         .collect();
     let kept = |x: usize, y: usize| label[y * width + x] != NONE && keep[label[y * width + x] as usize];
 
@@ -495,7 +534,8 @@ pub struct SolidView {
     /// Copy of the newest frame, so a slider change can redraw an app that is not repainting.
     last: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, SizeInt32)>,
     staging: Option<(ID3D11Texture2D, u32)>,
-    key: Option<[u8; 3]>,
+    /// The app's flat background colors, main one first. Empty draws the app unchanged.
+    keys: Vec<[u8; 3]>,
     keyed_at: Option<Instant>,
     regions: Option<Regions>,
 }
@@ -562,7 +602,7 @@ impl SolidView {
                 size,
                 last: None,
                 staging: None,
-                key: None,
+                keys: Vec::new(),
                 keyed_at: None,
                 regions: None,
             },
@@ -588,18 +628,18 @@ impl SolidView {
                 .map_err(err("Render target"))?;
             self.target_view = target_view;
         }
-        if let Some(key) = self.key {
+        if !self.keys.is_empty() {
             let stale = self.regions.as_ref().is_none_or(|regions| regions.content != content);
             if stale {
                 self.regions = Some(Regions::new(renderer, content)?);
             }
             if let Some(regions) = self.regions.as_ref().filter(|_| fresh || stale) {
-                regions.update(renderer, &view, key)?;
+                regions.update(renderer, &view, &self.keys)?;
             }
         }
         let target = self.target_view.as_ref().ok_or("No render target.")?;
         let background = self.regions.as_ref().map(|regions| &regions.mask_view);
-        let params = params(content, self.key, background_alpha);
+        let params = params(content, &self.keys, background_alpha);
         renderer.render(&view, background, target, self.size, &params);
         unsafe { self.swapchain.Present(0, DXGI_PRESENT(0)) }.ok().map_err(err("Present"))?;
         Ok(true)
@@ -616,7 +656,9 @@ impl SolidView {
         let Some(frame) = newest else {
             return Ok(false);
         };
-        let content = frame.ContentSize().map_err(err("Frame size"))?;
+        // The window's real size. When it grows, frames keep arriving in the old, smaller
+        // buffers until the pool is recreated, so only the part that fits is drawn meanwhile.
+        let window = frame.ContentSize().map_err(err("Frame size"))?;
         let texture: ID3D11Texture2D = frame
             .Surface()
             .and_then(|surface| surface.cast::<IDirect3DDxgiInterfaceAccess>())
@@ -624,13 +666,13 @@ impl SolidView {
             .map_err(err("Frame"))?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut desc) };
-        if content.Width <= 0 || content.Height <= 0 {
+        if window.Width <= 0 || window.Height <= 0 {
             let _ = frame.Close();
             return Ok(false);
         }
         let content = SizeInt32 {
-            Width: content.Width.min(desc.Width as i32),
-            Height: content.Height.min(desc.Height as i32),
+            Width: window.Width.min(desc.Width as i32),
+            Height: window.Height.min(desc.Height as i32),
         };
 
         let reusable = self.last.as_ref().is_some_and(|(copy, _, _)| {
@@ -664,8 +706,8 @@ impl SolidView {
         }
         let _ = frame.Close();
 
-        if content.Width != self.size.Width || content.Height != self.size.Height {
-            self.size = content;
+        if window.Width != self.size.Width || window.Height != self.size.Height {
+            self.size = window;
             self.target_view = None;
             unsafe {
                 renderer.context.OMSetRenderTargets(None, None);
@@ -673,15 +715,15 @@ impl SolidView {
                 self.swapchain
                     .ResizeBuffers(
                         2,
-                        content.Width as u32,
-                        content.Height as u32,
+                        window.Width as u32,
+                        window.Height as u32,
                         DXGI_FORMAT_B8G8R8A8_UNORM,
                         DXGI_SWAP_CHAIN_FLAG(0),
                     )
                     .map_err(err("Resize"))?;
             }
             self.pool
-                .Recreate(&renderer.capture_device, FORMAT, 2, content)
+                .Recreate(&renderer.capture_device, FORMAT, 2, window)
                 .map_err(err("Capture buffers"))?;
         }
         Ok(true)
@@ -737,9 +779,7 @@ impl SolidView {
             }
             renderer.context.Unmap(staging, 0);
         }
-        if let Some(key) = background_color(&pixels) {
-            self.key = Some(key);
-        }
+        self.keys = background_colors(&pixels, width as usize, &self.keys);
     }
 }
 
@@ -751,18 +791,56 @@ impl Drop for SolidView {
     }
 }
 
-/// The most common opaque color in BGRA pixels, as RGB, if it covers enough of them.
-pub fn background_color(bgra: &[u8]) -> Option<[u8; 3]> {
-    let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
+/// The app's flat background colors in rows of BGRA pixels `width` wide, as RGB, main one
+/// first. The main one is the most common color overall. The others, like a sidebar in its own
+/// shade, are colors that fill long runs, which text never does. Colors in `current` are kept
+/// at a lower share than new ones need, so the result stays steady while the app scrolls.
+pub fn background_colors(bgra: &[u8], width: usize, current: &[[u8; 3]]) -> Vec<[u8; 3]> {
+    let mut all: HashMap<[u8; 3], usize> = HashMap::new();
+    let mut runs: HashMap<[u8; 3], usize> = HashMap::new();
     let mut opaque = 0usize;
-    for pixel in bgra.as_chunks::<4>().0 {
-        if pixel[3] == 255 {
-            opaque += 1;
-            *counts.entry([pixel[2], pixel[1], pixel[0]]).or_default() += 1;
+    for row in bgra.chunks_exact(width * 4) {
+        let pixels = row.as_chunks::<4>().0;
+        let mut start = 0;
+        while start < pixels.len() {
+            let pixel = pixels[start];
+            let end = start + pixels[start..].iter().take_while(|&&other| other == pixel).count();
+            if pixel[3] == 255 {
+                let color = [pixel[2], pixel[1], pixel[0]];
+                let length = end - start;
+                opaque += length;
+                *all.entry(color).or_default() += length;
+                if length >= RUN_MIN {
+                    *runs.entry(color).or_default() += length;
+                }
+            }
+            start = end;
         }
     }
-    let (color, count) = counts.into_iter().max_by_key(|&(_, count)| count)?;
-    (count as f32 >= opaque as f32 * KEY_MIN_SHARE).then_some(color)
+    let share = |count: usize| count as f32 / opaque.max(1) as f32;
+    let held = |color: &[u8; 3]| current.contains(color);
+    let ranked = |counts: &HashMap<[u8; 3], usize>| {
+        let mut ranked: Vec<([u8; 3], usize)> = counts.iter().map(|(&color, &count)| (color, count)).collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked
+    };
+
+    let main = current
+        .first()
+        .filter(|color| share(all.get(*color).copied().unwrap_or(0)) >= KEY_KEEP_SHARE)
+        .copied()
+        .or_else(|| ranked(&all).first().filter(|(_, count)| share(*count) >= KEY_MIN_SHARE).map(|(color, _)| *color));
+    let Some(main) = main else {
+        return Vec::new();
+    };
+    let mut keys = vec![main];
+    for (color, count) in ranked(&runs) {
+        let needed = if held(&color) { PANE_KEEP_SHARE } else { PANE_MIN_SHARE };
+        if keys.len() < MAX_KEYS && color != main && share(count) >= needed {
+            keys.push(color);
+        }
+    }
+    keys
 }
 
 #[cfg(test)]
@@ -773,19 +851,28 @@ mod tests {
         [rgb[2], rgb[1], rgb[0], 255]
     }
 
+    fn row(runs: &[([u8; 3], usize)]) -> Vec<u8> {
+        runs.iter()
+            .flat_map(|&(color, length)| std::iter::repeat_n(bgra(color), length).flatten())
+            .collect()
+    }
+
+    const DARK: [u8; 3] = [20, 20, 20];
+    const SIDEBAR: [u8; 3] = [14, 14, 16];
+    const INK: [u8; 3] = [230, 230, 230];
+
     #[test]
-    fn background_is_the_most_common_opaque_color() {
-        let mut pixels = Vec::new();
-        for _ in 0..60 {
-            pixels.extend_from_slice(&bgra([20, 20, 20]));
-        }
-        for _ in 0..30 {
-            pixels.extend_from_slice(&bgra([230, 230, 230]));
-        }
-        for _ in 0..100 {
-            pixels.extend_from_slice(&[0, 0, 0, 0]);
-        }
-        assert_eq!(background_color(&pixels), Some([20, 20, 20]));
+    fn main_background_and_panes_are_found() {
+        let pixels = row(&[(SIDEBAR, 40), (DARK, 150), ([0, 0, 0], 10)]);
+        assert_eq!(background_colors(&pixels, 200, &[]), vec![DARK, SIDEBAR]);
+    }
+
+    #[test]
+    fn text_color_is_never_a_background() {
+        // Lots of text: the ink is common, but only ever in short runs.
+        let text: Vec<_> = (0..40).flat_map(|_| [(DARK, 3), (INK, 2)]).collect();
+        let pixels = row(&text);
+        assert_eq!(background_colors(&pixels, 200, &[]), vec![DARK]);
     }
 
     #[test]
@@ -793,11 +880,21 @@ mod tests {
         let pixels: Vec<u8> = (0..200u32)
             .flat_map(|i| bgra([(i % 256) as u8, (i * 7 % 256) as u8, 40]))
             .collect();
-        assert_eq!(background_color(&pixels), None);
+        assert_eq!(background_colors(&pixels, 200, &[]), Vec::<[u8; 3]>::new());
     }
 
-    const W: u32 = 96;
-    const H: u32 = 72;
+    #[test]
+    fn found_colors_stay_while_they_dip() {
+        // The main color at 15% and the sidebar at 2%: too little to be picked fresh, enough
+        // to be kept once found.
+        let mut pixels = row(&[(DARK, 150), (SIDEBAR, 20)]);
+        pixels.extend((0..830u32).flat_map(|i| bgra([(i % 200) as u8 + 40, (i * 7 % 200) as u8 + 40, 90])));
+        assert_eq!(background_colors(&pixels, 1000, &[]), Vec::<[u8; 3]>::new());
+        assert_eq!(background_colors(&pixels, 1000, &[DARK, SIDEBAR]), vec![DARK, SIDEBAR]);
+    }
+
+    const W: u32 = 256;
+    const H: u32 = 192;
     const KEY: [u8; 3] = [31, 31, 31];
     const ALPHA: f32 = 0.7;
 
@@ -820,6 +917,8 @@ mod tests {
                     KEY
                 } else if (16..68).contains(&y) && (44..92).contains(&x) {
                     [200, (x * 2) as u8, (y * 3) as u8]
+                } else if x >= 216 {
+                    SIDEBAR
                 } else {
                     KEY
                 };
@@ -830,7 +929,7 @@ mod tests {
     }
 
     /// Run the shader on BGRA pixels and read back the premultiplied BGRA result.
-    fn render_on_gpu(renderer: &Renderer, pixels: &[u8], key: Option<[u8; 3]>) -> Vec<u8> {
+    fn render_on_gpu(renderer: &Renderer, pixels: &[u8], keys: &[[u8; 3]]) -> Vec<u8> {
         use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_SUBRESOURCE_DATA};
         let size = SizeInt32 { Width: W as i32, Height: H as i32 };
         let desc = D3D11_TEXTURE2D_DESC {
@@ -865,11 +964,11 @@ mod tests {
 
             let view = view.unwrap();
             let regions = Regions::new(renderer, size).unwrap();
-            if let Some(key) = key {
-                regions.update(renderer, &view, key).unwrap();
+            if !keys.is_empty() {
+                regions.update(renderer, &view, keys).unwrap();
             }
             let background = Some(&regions.mask_view);
-            renderer.render(&view, background, target_view.as_ref().unwrap(), size, &params(size, key, ALPHA));
+            renderer.render(&view, background, target_view.as_ref().unwrap(), size, &params(size, keys, ALPHA));
             renderer.context.CopyResource(&staging, &target);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             renderer.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).unwrap();
@@ -895,12 +994,14 @@ mod tests {
             Err(error) => return eprintln!("skipped, no GPU capture: {error}"),
         };
         let input = scene();
-        let output = render_on_gpu(&renderer, &input, Some(KEY));
+        let output = render_on_gpu(&renderer, &input, &[KEY, SIDEBAR]);
 
         let glass = (ALPHA * 255.0).round() as i32;
         let [b, _, _, a] = at(&output, 60, 4);
         assert!((a as i32 - glass).abs() <= 1, "background alpha {a}");
         assert!((b as i32 - (31.0 * ALPHA) as i32).abs() <= 1, "background color {b}");
+        let sidebar = at(&output, 240, 100)[3];
+        assert!((sidebar as i32 - glass).abs() <= 1, "a pane in another color, alpha {sidebar}");
 
         assert_eq!(at(&output, 4, 8), at(&input, 4, 8), "text stays solid");
         let edge = at(&output, 5, 8)[3];
@@ -921,10 +1022,10 @@ mod tests {
     fn without_a_background_color_the_app_is_unchanged() {
         let Ok(renderer) = Renderer::new() else { return };
         let input = scene();
-        assert_eq!(render_on_gpu(&renderer, &input, None), input);
+        assert_eq!(render_on_gpu(&renderer, &input, &[]), input);
     }
 
-    /// A grid of blocks that all match, with `holes` cleared.
+    /// Block counts for a grid where every block matches, with `holes` cleared.
     fn blocks(width: usize, height: usize, holes: impl Fn(usize, usize) -> bool) -> Vec<u8> {
         (0..width * height)
             .map(|i| if holes(i % width, i / width) { 0 } else { BLOCK as u8 * BLOCK as u8 })
@@ -933,11 +1034,12 @@ mod tests {
 
     #[test]
     fn enclosed_patches_are_not_background() {
+        // A 48-block patch inside a 1200-block window: too small to be a pane.
         let ring = |x: usize, y: usize| {
             (2..=11).contains(&x) && (2..=9).contains(&y) && (x == 2 || x == 11 || y == 2 || y == 9)
         };
-        let mask = background_blocks(&blocks(14, 12, ring), 14, 12);
-        let at = |x: usize, y: usize| mask[y * 14 + x];
+        let mask = background_blocks(&blocks(40, 30, ring), &[0; 1200], 40, 30);
+        let at = |x: usize, y: usize| mask[y * 40 + x];
         assert_eq!(at(0, 0), 255, "outside is background");
         assert_eq!(at(2, 5), 255, "the ring's outer edge can blend");
         assert_eq!(at(3, 3), 0, "inside the ring is not");
@@ -947,12 +1049,33 @@ mod tests {
     #[test]
     fn letter_holes_and_edge_panes_are_background() {
         let letter = |x: usize, y: usize| (5..=7).contains(&x) && (5..=7).contains(&y) && (x, y) != (6, 6);
-        let mask = background_blocks(&blocks(14, 12, letter), 14, 12);
+        let mask = background_blocks(&blocks(14, 12, letter), &[0; 168], 14, 12);
         assert_eq!(mask[6 * 14 + 6], 255, "inside of a letter");
 
         let divider = |x: usize, _: usize| x == 4 || x == 5;
-        let mask = background_blocks(&blocks(14, 12, divider), 14, 12);
+        let mask = background_blocks(&blocks(14, 12, divider), &[0; 168], 14, 12);
         assert_eq!(mask[6 * 14 + 1], 255, "the smaller pane touching the edge");
         assert_eq!(mask[6 * 14 + 10], 255);
+    }
+
+    #[test]
+    fn big_enclosed_panes_are_background() {
+        let ring = |x: usize, y: usize| {
+            (5..=30).contains(&x) && (5..=24).contains(&y) && (x == 5 || x == 30 || y == 5 || y == 24)
+        };
+        let mask = background_blocks(&blocks(40, 30, ring), &[0; 1200], 40, 30);
+        assert_eq!(mask[15 * 40 + 18], 255);
+    }
+
+    #[test]
+    fn a_flat_image_area_in_another_background_color_stays_solid() {
+        // A small patch of the sidebar's color right against the main background, like a
+        // picture with a flat backdrop: it does not join the main background.
+        let colors: Vec<u8> = (0..1200)
+            .map(|i| u8::from((10..16).contains(&(i % 40)) && (10..16).contains(&(i / 40))))
+            .collect();
+        let mask = background_blocks(&blocks(40, 30, |_, _| false), &colors, 40, 30);
+        assert_eq!(mask[13 * 40 + 13], 0);
+        assert_eq!(mask[0], 255);
     }
 }

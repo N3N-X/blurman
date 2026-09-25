@@ -3,7 +3,7 @@
 use crate::mapping::{self, RestoreAction, SavedStyle};
 use crate::rules::Rule;
 use std::collections::HashMap;
-use windows::core::BOOL;
+use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, COLORREF, FILETIME, HANDLE, HWND, LPARAM, RECT,
     WIN32_ERROR,
@@ -21,7 +21,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -240,6 +240,22 @@ fn window_text(hwnd: HWND) -> String {
         let mut buf = vec![0u16; len as usize + 1];
         let copied = GetWindowTextW(hwnd, &mut buf);
         String::from_utf16_lossy(&buf[..copied as usize])
+    }
+}
+
+/// The executable name behind `hwnd`, if it is a window that could be frosted. Cheap enough to
+/// call for every window Windows reports as shown.
+pub fn frostable_process(hwnd: HWND) -> Option<String> {
+    let window = inspect_window(hwnd)?;
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, window.pid).ok()?;
+        let mut path = [0u16; 1024];
+        let mut len = path.len() as u32;
+        let named =
+            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(process);
+        let path = String::from_utf16_lossy(&path[..len as usize]);
+        named.then(|| path.rsplit('\\').next().unwrap_or(&path).to_string())
     }
 }
 

@@ -3,6 +3,8 @@
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use windows::core::BOOL;
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, SetForegroundWindow, ShowWindowAsync, SW_HIDE, SW_RESTORE, SW_SHOW,
 };
@@ -57,6 +59,7 @@ impl Shared {
         if hwnd.0.is_null() {
             return;
         }
+        self.cloak_window(false);
         unsafe {
             let command = if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW };
             let _ = ShowWindowAsync(hwnd, command);
@@ -70,6 +73,22 @@ impl Shared {
         if !hwnd.0.is_null() {
             unsafe {
                 let _ = ShowWindowAsync(hwnd, SW_HIDE);
+            }
+        }
+    }
+
+    /// A cloaked window stays invisible and off the taskbar even while Windows considers it shown.
+    pub fn cloak_window(&self, cloaked: bool) {
+        let hwnd = crate::target::hwnd_of(self.main_window.load(Ordering::SeqCst));
+        if !hwnd.0.is_null() {
+            let value = BOOL::from(cloaked);
+            unsafe {
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CLOAK,
+                    (&raw const value).cast(),
+                    size_of::<BOOL>() as u32,
+                );
             }
         }
     }

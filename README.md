@@ -11,7 +11,7 @@ Frosted glass behind the Windows apps you pick. Chrome, Edge, Electron apps, Not
 - Pick any running app, set **transparency** and **blur**, and press **Frost it**. Sliders apply live.
 - Rules are saved per app and come back on every new window of that app.
 - **Pause** puts every app back without deleting rules. **Restore all** deletes them.
-- **Start with Windows**, and **Keep in tray on close** so apps stay frosted while the window is closed.
+- **Start with Windows** runs Blurman quietly in the tray at sign-in. **Keep in tray on close** does the same for normal launches, so apps stay frosted while the window is closed.
 - Glass follows the app as you move, resize, minimize, or switch virtual desktops.
 - If Blurman crashes or is killed, the next start (or `blurman clear --all`) puts every app back.
 

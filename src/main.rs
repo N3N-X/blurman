@@ -27,7 +27,7 @@ use windows::Win32::UI::HiDpi::{
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Set by the Windows startup entry: open minimized, or in the tray if that option is on.
+    /// Set by the Windows startup entry: run in the tray without opening the window.
     #[arg(long, hide = true)]
     startup: bool,
 }

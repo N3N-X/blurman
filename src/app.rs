@@ -18,13 +18,12 @@ const RESCAN: Duration = Duration::from_secs(1);
 
 pub fn run(shared: Arc<Shared>, startup: bool) -> Result<(), String> {
     let settings = rules::load_settings();
-    let start_in_tray = startup && settings.close_to_tray;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Blurman")
             .with_inner_size([560.0, 800.0])
             .with_min_inner_size([480.0, 600.0])
-            .with_visible(!start_in_tray)
+            .with_visible(!startup)
             .with_icon(icon_rgba()),
         ..Default::default()
     };
@@ -40,8 +39,7 @@ pub fn run(shared: Arc<Shared>, startup: bool) -> Result<(), String> {
                 }
             }
             tray::install_handlers(shared.clone());
-            let minimize = startup && !start_in_tray;
-            Ok(Box::new(BlurmanApp::new(shared, settings, minimize)))
+            Ok(Box::new(BlurmanApp::new(shared, settings, startup)))
         }),
     )
     .map_err(|err| err.to_string())
@@ -66,15 +64,23 @@ struct BlurmanApp {
     selected: Option<String>,
     transparency: u8,
     blur: u8,
-    minimize_pending: bool,
+    /// Launched by Windows startup: this session lives in the tray whatever the setting says.
+    startup: bool,
+    /// eframe shows the window after painting the first frame, so a tray start keeps it cloaked
+    /// and hides it after that.
+    hide_pending: bool,
 }
 
 impl BlurmanApp {
-    fn new(shared: Arc<Shared>, settings: Settings, minimize: bool) -> Self {
+    fn new(shared: Arc<Shared>, settings: Settings, startup: bool) -> Self {
         let store = rules::load();
-        // The window may start hidden in the tray, where `update` does not run yet.
-        let tray_error = tray::sync(settings.close_to_tray, store.paused).err();
+        let tray_error = tray::sync(settings.close_to_tray || startup, store.paused).err();
+        let hide_pending = startup && tray_error.is_none();
+        if hide_pending {
+            shared.cloak_window(true);
+        }
         Self {
+            hide_pending,
             shared,
             store,
             settings,
@@ -87,12 +93,16 @@ impl BlurmanApp {
             selected: None,
             transparency: TRANSPARENCY_DEFAULT,
             blur: BLUR_DEFAULT,
-            minimize_pending: minimize,
+            startup,
         }
     }
 
+    fn wants_tray(&self) -> bool {
+        self.settings.close_to_tray || self.startup
+    }
+
     fn keeps_in_tray(&self) -> bool {
-        self.settings.close_to_tray && self.tray_error.is_none()
+        self.wants_tray() && self.tray_error.is_none()
     }
 
     fn rescan(&mut self) {
@@ -410,7 +420,7 @@ impl BlurmanApp {
                 ui,
                 "Start with Windows",
                 "Open Blurman when you sign in, so your apps are frosted right away. \
-                 With the tray option on, it starts quietly in the tray.",
+                 It starts quietly in the tray; click the tray icon to open this window.",
                 &mut autostart,
             ) {
                 match autostart::set_enabled(autostart) {
@@ -429,7 +439,7 @@ impl BlurmanApp {
                 if let Err(err) = rules::save_settings(&self.settings) {
                     self.shared.set_status(format!("Could not save settings: {err}"));
                 }
-                self.tray_error = tray::sync(self.settings.close_to_tray, self.store.paused).err();
+                self.tray_error = tray::sync(self.wants_tray(), self.store.paused).err();
             }
             if let Some(err) = &self.tray_error {
                 ui.colored_label(WARN, err);
@@ -461,8 +471,13 @@ impl BlurmanApp {
 impl eframe::App for BlurmanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(RESCAN);
-        if std::mem::take(&mut self.minimize_pending) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        if self.hide_pending {
+            if ctx.cumulative_pass_nr() == 0 {
+                ctx.request_repaint();
+            } else {
+                self.hide_pending = false;
+                self.shared.hide_window();
+            }
         }
         if ctx.input(|input| input.viewport().close_requested()) && self.keeps_in_tray() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -472,7 +487,7 @@ impl eframe::App for BlurmanApp {
         if self.scanned.elapsed() >= RESCAN {
             self.rescan();
         }
-        if self.settings.close_to_tray {
+        if self.wants_tray() {
             self.tray_error = tray::sync(true, self.store.paused).err();
         }
 

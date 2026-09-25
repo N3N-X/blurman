@@ -23,16 +23,13 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess, OpenProcessToken,
     QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Shell::{
-    SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetLayeredWindowAttributes, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
     IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetLayeredWindowAttributes, SetWindowLongPtrW,
-    SetWindowPos, GA_ROOT, GWL_EXSTYLE, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST,
+    SetWindowPos, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WS_CAPTION, WS_CHILD, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
 };
 
 #[derive(Debug, Clone)]
@@ -159,7 +156,8 @@ fn inspect_window(hwnd: HWND) -> Option<LiveWindow> {
             return None;
         }
         let bounds = frame_bounds(hwnd);
-        if bounds.right - bounds.left < 160 || bounds.bottom - bounds.top < 90 {
+        // A minimized window keeps its glass hidden but stays faded, so it restores already frosted.
+        if !IsIconic(hwnd).as_bool() && (bounds.right - bounds.left < 160 || bounds.bottom - bounds.top < 90) {
             return None;
         }
         let mut pid = 0u32;
@@ -219,6 +217,10 @@ pub fn is_out_of_view(hwnd: HWND) -> bool {
     unsafe { IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) }
 }
 
+pub fn is_minimized(hwnd: HWND) -> bool {
+    unsafe { IsIconic(hwnd).as_bool() }
+}
+
 pub fn is_topmost(hwnd: HWND) -> bool {
     unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 }
 }
@@ -243,12 +245,44 @@ fn window_text(hwnd: HWND) -> String {
     }
 }
 
-/// The executable name behind `hwnd`, if it is a window that could be frosted. Cheap enough to
-/// call for every window Windows reports as shown.
+/// The executable name behind `hwnd`, if it is a window that could be frosted now.
 pub fn frostable_process(hwnd: HWND) -> Option<String> {
-    let window = inspect_window(hwnd)?;
+    process_name(inspect_window(hwnd)?.pid)
+}
+
+pub fn is_frostable(hwnd: HWND) -> bool {
+    inspect_window(hwnd).is_some()
+}
+
+/// The process id behind a top-level window with a title bar or sizing border and a real size.
+/// Judged without needing the window to be visible or titled, so it works the moment the window
+/// is created. Menus, tooltips, and hidden helper windows are left alone.
+pub fn early_candidate(hwnd: HWND) -> Option<u32> {
     unsafe {
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, window.pid).ok()?;
+        if GetAncestor(hwnd, GA_ROOT) != hwnd {
+            return None;
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if style & WS_CHILD.0 != 0 || exstyle & WS_EX_TOOLWINDOW.0 != 0 {
+            return None;
+        }
+        if style & WS_CAPTION.0 != WS_CAPTION.0 && style & WS_THICKFRAME.0 == 0 {
+            return None;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() || rect.right - rect.left < 160 || rect.bottom - rect.top < 90 {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        (pid != 0).then_some(pid)
+    }
+}
+
+pub fn process_name(pid: u32) -> Option<String> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut path = [0u16; 1024];
         let mut len = path.len() as u32;
         let named =
@@ -290,7 +324,7 @@ fn process_names() -> HashMap<u32, String> {
     names
 }
 
-fn process_start(pid: u32) -> u64 {
+pub fn process_start(pid: u32) -> u64 {
     unsafe {
         let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
             return 0;
@@ -372,10 +406,6 @@ pub fn capture_style(hwnd: HWND) -> SavedStyle {
 }
 
 pub fn apply_alpha(hwnd: HWND, transparency: u8, nudge: bool) -> Result<(), String> {
-    set_alpha(hwnd, mapping::transparency_to_alpha(transparency), nudge)
-}
-
-pub fn set_alpha(hwnd: HWND, alpha: u8, nudge: bool) -> Result<(), String> {
     unsafe {
         if !IsWindow(Some(hwnd)).as_bool() {
             return Err("The window is gone.".into());
@@ -399,6 +429,7 @@ pub fn set_alpha(hwnd: HWND, alpha: u8, nudge: bool) -> Result<(), String> {
                 nudge_resize(hwnd);
             }
         }
+        let alpha = mapping::transparency_to_alpha(transparency);
         SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).map_err(|err| err.to_string())
     }
 }
@@ -440,14 +471,6 @@ pub fn restore_alpha(hwnd: HWND, saved: &SavedStyle) {
             }
         }
     }
-}
-
-/// A fullscreen game, video, or presentation is in front.
-pub fn fullscreen_in_front() -> bool {
-    matches!(
-        unsafe { SHQueryUserNotificationState() },
-        Ok(QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
-    )
 }
 
 /// The HWND still belongs to the same process instance we saw earlier.

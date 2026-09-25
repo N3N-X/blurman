@@ -109,7 +109,6 @@ struct BlurmanApp {
     selected: Option<String>,
     transparency: u8,
     blur: u8,
-    solid_text: bool,
     /// Launched by Windows startup: this session lives in the tray whatever the setting says.
     startup: bool,
     /// The window has a frosted backdrop showing through wherever nothing is drawn.
@@ -133,7 +132,6 @@ impl BlurmanApp {
             selected: None,
             transparency: TRANSPARENCY_DEFAULT,
             blur: BLUR_DEFAULT,
-            solid_text: false,
             startup,
             glass,
         }
@@ -164,7 +162,7 @@ impl BlurmanApp {
 
     fn sliders_from_rule(&mut self) {
         if let Some(rule) = self.selected_rule() {
-            (self.transparency, self.blur, self.solid_text) = (rule.transparency, rule.blur, rule.solid_text);
+            (self.transparency, self.blur) = (rule.transparency, rule.blur);
         }
     }
 
@@ -187,7 +185,7 @@ impl BlurmanApp {
         };
         self.store.paused = false;
         self.store
-            .upsert(rules::new_rule(&process, self.transparency, self.blur, self.solid_text));
+            .upsert(rules::new_rule(&process, self.transparency, self.blur));
         self.publish();
     }
 
@@ -342,14 +340,6 @@ impl BlurmanApp {
                         .changed();
                     ui.end_row();
                 });
-            ui.add_space(6.0);
-            moved |= setting_row(
-                ui,
-                "Solid text  ·  experimental",
-                "Only the background turns to glass; text and images stay solid. Blurman shows a \
-                 live copy of the app, so it uses a little GPU and lags about one frame.",
-                &mut self.solid_text,
-            );
             if ruled && moved {
                 self.frost_selected();
             }
@@ -419,14 +409,6 @@ impl BlurmanApp {
                                 if ui.add(theme::danger_button("Remove").small()).clicked() {
                                     delete = Some(rule.process.clone());
                                 }
-                                ui.add_space(6.0);
-                                changed |= theme::toggle(ui, &mut rule.solid_text)
-                                    .on_hover_text(
-                                        "Only the background turns to glass; text and images stay solid.",
-                                    )
-                                    .changed();
-                                let color = if rule.solid_text { ACCENT } else { MUTED };
-                                ui.label(RichText::new("Solid text").small().color(color));
                             });
                         });
                         ui.horizontal(|ui| {
@@ -502,22 +484,6 @@ impl BlurmanApp {
             }
             if let Some(err) = &self.tray_error {
                 ui.colored_label(WARN, err);
-            }
-        });
-        ui.add_space(4.0);
-        theme::card(ui, |ui| {
-            ui.label(theme::card_title("Solid text"));
-            if setting_row(
-                ui,
-                "Keep solid text during fullscreen games",
-                "Off: while a game or other fullscreen app is in front, solid-text apps switch to \
-                 the normal fade so capturing them never costs the game anything.",
-                &mut self.settings.solid_text_in_fullscreen,
-            ) {
-                if let Err(err) = rules::save_settings(&self.settings) {
-                    self.shared.set_status(format!("Could not save settings: {err}"));
-                }
-                ipc::signal(ipc::msg_reload());
             }
         });
         ui.add_space(4.0);
@@ -633,7 +599,7 @@ fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -
                     );
                     ui.label(theme::muted(count).small());
                     if let Some(rule) = rule {
-                        theme::badge(ui, if rule.solid_text { "Frosted · solid text" } else { "Frosted" }, ACCENT);
+                        theme::badge(ui, &format!("Frosted · {}%", rule.transparency), ACCENT);
                     }
                     if group.elevated {
                         theme::badge(ui, "Admin", WARN);

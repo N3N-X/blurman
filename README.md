@@ -9,8 +9,7 @@ Frosted glass behind the Windows apps you pick. Chrome, Edge, Electron apps, Not
 ## Features
 
 - Pick any running app, set **transparency** and **blur**, and press **Frost it**. Sliders apply live.
-- Rules are saved per app and come back on every new window of that app.
-- **Solid text** (experimental, per app) turns only the app's background to glass and keeps text and images fully solid. Switch it on or off right on each saved rule. See [Solid text](#solid-text).
+- Rules are saved per app and come back on every new window of that app. New windows are faded the moment the app creates them, so they never appear solid first.
 - On Windows 11 the Blurman window is frosted glass itself, using the system acrylic backdrop.
 - **Pause** puts every app back without deleting rules. **Restore all** deletes them.
 - **Start with Windows** runs Blurman quietly in the tray at sign-in. **Keep in tray on close** does the same for normal launches, so apps stay frosted while the window is closed.
@@ -44,7 +43,6 @@ There is also a small command line:
 ```powershell
 blurman list                                        # visible apps Blurman can frost
 blurman apply chrome.exe --transparency 30 --blur 40  # save a rule; opens Blurman if needed
-blurman apply chrome.exe --solid-text               # same, with solid text
 blurman clear chrome.exe                            # remove one rule
 blurman clear --all                                 # remove every rule and put every app back
 ```
@@ -57,16 +55,6 @@ Rules live in `%APPDATA%\Blurman\rules.json` and settings in `settings.json` nex
 
 Windows cannot blur only the background of another app's window, so Blurman does two things. It fades the whole app with layered-window alpha, and it places a glass window of its own directly behind the app. The glass uses Windows composition to Gaussian-blur whatever is behind it, so what shows through the faded app is frosted instead of sharp. Because the fade applies to the whole window, text fades a little too. Transparency is capped at 70 percent so it stays readable.
 
+Blurman watches window events, so a new window of a ruled app is faded as soon as the app creates it, usually before it is first drawn. The glass is added a few milliseconds later, when the window appears. Blurman only changes the window's style from outside the app; it never injects code into other processes.
+
 Apps running as administrator can only be frosted when Blurman runs as administrator too. They show an **Admin** badge in the app list.
-
-### Solid text
-
-With **Solid text** on, Blurman hides the real app (it stays at alpha 1, so it still gets every click and key) and shows a live copy of it on the glass instead. The copy comes from Windows Graphics Capture. A small GPU shader turns only patches of the app's flat background colors into glass, blending the edges of text into them. Blurman finds up to four such colors, like a main pane and a sidebar in a different shade, by looking for colors that fill long runs, which text never does. Found colors are kept steady while you scroll. Only patches that belong to the app's layout turn to glass: the main background, panes touching the window edge, and other large panes. A flat area of one of those colors inside an image or video, with image content around it, stays solid. Everything else is drawn exactly as the app drew it.
-
-One case cannot be told apart: an image whose flat background runs straight into the page with no edge in between, such as a white-background picture on a white page. That part of the image turns to glass along with the page.
-
-It costs a few percent of one CPU thread and about 40 MB of GPU memory per app. The copy trails the real app by about one frame. Protected video (DRM) shows as black, as in any screen capture. Backgrounds that are a gradient, a picture, or translucent get no glass, and while an app shows no clear background color at all, such as a fullscreen video, it is drawn unchanged.
-
-While a fullscreen game or presentation is in front, solid text falls back to the normal fade so it never competes with the game for the GPU. **Keep solid text during fullscreen games** in Settings turns that off.
-
-If Blurman is killed while an app is hidden, a small watchdog process (`blurman watchdog`) puts the app back within a second.

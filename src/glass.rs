@@ -9,8 +9,8 @@ use windows::Graphics::Effects::{
 use windows::System::DispatcherQueueController;
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    CompositionEffectBrush, CompositionEffectFactory, CompositionEffectSourceParameter,
-    CompositionStretch, Compositor, ContainerVisual, ICompositionSurface, SpriteVisual,
+    CompositionEffectBrush, CompositionEffectFactory, CompositionEffectSourceParameter, Compositor,
+    ContainerVisual,
 };
 use windows::Win32::Foundation::{E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -146,10 +146,6 @@ impl GlassSession {
         self.composition.is_none()
     }
 
-    pub fn compositor(&self) -> Option<&Compositor> {
-        self.composition.as_ref().map(|composition| &composition.compositor)
-    }
-
     pub fn open(&mut self, bounds: RECT, blur: u8) -> Result<GlassPane, String> {
         register_class()?;
         let hwnd = create_glass_window(bounds)?;
@@ -180,10 +176,8 @@ impl GlassSession {
 
 struct Visuals {
     _target: DesktopWindowTarget,
-    root: ContainerVisual,
+    _root: ContainerVisual,
     brush: CompositionEffectBrush,
-    /// The app's picture for solid text, drawn over the blur.
-    content: Option<SpriteVisual>,
 }
 
 pub struct GlassPane {
@@ -204,37 +198,6 @@ impl GlassPane {
             .Properties()
             .and_then(|props| props.InsertScalar(&HSTRING::from("Blur.BlurAmount"), radius))
             .map_err(|err| err.to_string())
-    }
-
-    /// Draw `surface` over the blur at its own pixel size, pinned to the top-left corner.
-    pub fn show_content(&mut self, compositor: &Compositor, surface: &ICompositionSurface) -> Result<(), String> {
-        let Some(visuals) = &mut self.visuals else {
-            return Err("Solid text needs the adjustable blur, which this PC does not have.".into());
-        };
-        let build = || -> windows::core::Result<SpriteVisual> {
-            let brush = compositor.CreateSurfaceBrushWithSurface(surface)?;
-            brush.SetStretch(CompositionStretch::None)?;
-            brush.SetHorizontalAlignmentRatio(0.0)?;
-            brush.SetVerticalAlignmentRatio(0.0)?;
-            let sprite = compositor.CreateSpriteVisual()?;
-            sprite.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
-            sprite.SetBrush(&brush)?;
-            visuals.root.Children()?.InsertAtTop(&sprite)?;
-            Ok(sprite)
-        };
-        let sprite = build().map_err(|err| format!("Could not draw the app on the glass: {}", err.message()))?;
-        if let Some(old) = visuals.content.replace(sprite) {
-            let _ = visuals.root.Children().and_then(|children| children.Remove(&old));
-        }
-        Ok(())
-    }
-
-    pub fn hide_content(&mut self) {
-        if let Some(visuals) = &mut self.visuals {
-            if let Some(sprite) = visuals.content.take() {
-                let _ = visuals.root.Children().and_then(|children| children.Remove(&sprite));
-            }
-        }
     }
 
     /// Size the pane to `bounds` and put it directly beneath `target` in the z-order.
@@ -343,9 +306,8 @@ fn attach_gaussian(composition: &Composition, hwnd: HWND, blur: u8) -> windows::
     target.SetRoot(&root)?;
     Ok(Visuals {
         _target: target,
-        root,
+        _root: root,
         brush,
-        content: None,
     })
 }
 

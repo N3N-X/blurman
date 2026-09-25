@@ -42,15 +42,6 @@ pub fn transparency_to_alpha(transparency: u8) -> u8 {
     (255.0 * (1.0 - t)).round() as u8
 }
 
-/// With solid text the real window sits on top at this alpha: invisible, but still hit by clicks,
-/// which pass through only at zero.
-pub const HIDDEN_ALPHA: u8 = 1;
-
-/// With solid text the slider sets how much of the app's background color stays over the glass.
-pub fn background_opacity(transparency: u8) -> f32 {
-    transparency_to_alpha(transparency) as f32 / 255.0
-}
-
 /// Maps the blur slider onto the Gaussian standard deviation in DIPs.
 /// The visible radius is about three times this value, so the slider covers
 /// roughly 12px to 144px of frost while the effect itself stays in a stable range.
@@ -107,8 +98,6 @@ mod tests {
         assert!(solid < 255);
         assert_eq!(transparency_to_alpha(0), solid);
         assert_eq!(transparency_to_alpha(100), glassy);
-        assert!(background_opacity(TRANSPARENCY_MIN) > background_opacity(TRANSPARENCY_MAX));
-        assert!(background_opacity(TRANSPARENCY_MAX) > 0.0);
     }
 
     #[test]

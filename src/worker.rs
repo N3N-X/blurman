@@ -1,27 +1,24 @@
 //! Owns the glass windows. Every WinRT and HWND call for the effect stays on this thread.
 
 use crate::glass::{GlassPane, GlassSession};
-use crate::ipc::{self, msg_reload, msg_show, msg_shutdown, HOST_CLASS};
-use crate::mapping::{self, SavedStyle};
-use crate::rules::{self, PersistedWindow, Rule, Settings, Store};
+use crate::ipc::{msg_reload, msg_show, msg_shutdown, HOST_CLASS};
+use crate::mapping::SavedStyle;
+use crate::rules::{self, PersistedWindow, Rule, Store};
 use crate::shared::Shared;
-use crate::solid::{Renderer, SolidView, WM_FRAME};
 use crate::target::{self, LiveWindow};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
-use windows::Win32::Foundation::{CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     RegisterClassExW, SetTimer, TranslateMessage, CHILDID_SELF, EVENT_OBJECT_CLOAKED,
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
-    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, MSG,
+    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, MSG,
     OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
@@ -29,19 +26,57 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// How often to look for new windows of ruled apps. Moves and z-order changes arrive as events.
 const SCAN_MS: u32 = 250;
 const SCAN_TIMER: usize = 1;
+/// How long a window faded at creation may go without becoming a normal app window before it
+/// is put back. Covers hidden helper windows and splash screens.
+const EARLY_WAIT: Duration = Duration::from_secs(3);
 
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
+    /// Window events that arrived while the engine was busy, as (event, HWND).
+    static EVENTS: RefCell<VecDeque<(u32, isize)>> = const { RefCell::new(VecDeque::new()) };
 }
 
-/// Runs `f` on this thread's engine. Skipped if the engine is already busy, which happens when
-/// a window event arrives while a cross-process call is waiting; the next scan catches up.
+/// Runs `f` on this thread's engine, then any window events that arrived meanwhile. Skipped if
+/// the engine is already busy, which happens when a call is re-entered while a cross-process
+/// call is waiting; the next scan catches up.
 fn with_engine(f: impl FnOnce(&mut Engine)) {
+    let ran = ENGINE.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return false;
+        };
+        if let Some(engine) = slot.as_mut() {
+            f(engine);
+        }
+        true
+    });
+    if ran {
+        drain_events();
+    }
+}
+
+/// Window events arrive in the middle of cross-process calls, when the engine is busy. They
+/// wait here instead of being dropped, so a window created in that moment is still faded.
+fn queue_event(event: u32, hwnd: isize) {
+    EVENTS.with(|events| {
+        let mut events = events.borrow_mut();
+        if !events.contains(&(event, hwnd)) {
+            events.push_back((event, hwnd));
+        }
+    });
+    drain_events();
+}
+
+fn drain_events() {
     ENGINE.with(|slot| {
-        if let Ok(mut slot) = slot.try_borrow_mut() {
-            if let Some(engine) = slot.as_mut() {
-                f(engine);
-            }
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return;
+        };
+        let Some(engine) = slot.as_mut() else {
+            EVENTS.with(|events| events.borrow_mut().clear());
+            return;
+        };
+        while let Some((event, hwnd)) = EVENTS.with(|events| events.borrow_mut().pop_front()) {
+            engine.on_event(event, target::hwnd_of(hwnd));
         }
     });
 }
@@ -54,26 +89,9 @@ struct Tracked {
     transparency: u8,
     blur: u8,
     pane: GlassPane,
-    solid_text: bool,
-    /// Live capture of the app while solid text is on.
-    view: Option<SolidView>,
-    /// The real window is at `HIDDEN_ALPHA` and the glass shows its copy.
-    hidden: bool,
 }
 
 impl Tracked {
-    /// Back to the plain fade: make the app visible first so it never blinks out.
-    fn stop_solid(&mut self, hwnd: HWND) -> Result<(), String> {
-        let result = if std::mem::take(&mut self.hidden) {
-            target::apply_alpha(hwnd, self.transparency, false)
-        } else {
-            Ok(())
-        };
-        self.view = None;
-        self.pane.hide_content();
-        result
-    }
-
     fn follow(&mut self, hwnd: HWND) {
         if target::is_out_of_view(hwnd) {
             self.pane.hide();
@@ -86,16 +104,12 @@ impl Tracked {
 
 struct Engine {
     shared: Arc<Shared>,
-    host: HWND,
     glass: GlassSession,
-    /// Created the first time an app asks for solid text.
-    renderer: Option<Renderer>,
     store: Store,
-    settings: Settings,
-    /// A fullscreen game is in front, so solid text is paused.
-    gaming: bool,
-    watchdog: bool,
     tracked: HashMap<isize, Tracked>,
+    /// Windows of ruled apps faded the moment they were created, waiting to be shown and titled
+    /// so they can get their glass. Keeps the original style and when the fade went on.
+    early: HashMap<isize, (PersistedWindow, Instant)>,
     /// Original styles remembered from an earlier run, keyed by HWND.
     prior: HashMap<isize, PersistedWindow>,
     /// Windows that refused the effect, so they are not retried on every scan.
@@ -112,7 +126,7 @@ pub fn run(shared: Arc<Shared>) {
             return;
         }
     };
-    let engine = Engine::new(shared.clone(), host);
+    let engine = Engine::new(shared.clone());
     ENGINE.with(|slot| *slot.borrow_mut() = Some(engine));
     with_engine(Engine::reload);
     let hooks = install_hooks();
@@ -127,9 +141,7 @@ pub fn run(shared: Arc<Shared>) {
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
         if message.hwnd == host {
-            if message.message == WM_FRAME {
-                with_engine(|engine| engine.on_frame(message.wParam.0 as isize));
-            } else if message.message == WM_TIMER {
+            if message.message == WM_TIMER {
                 with_engine(Engine::reconcile);
             } else if message.message == reload {
                 with_engine(Engine::reload);
@@ -169,25 +181,8 @@ pub fn restore_leftovers() {
     let _ = rules::save_state(&[]);
 }
 
-/// Wait for the Blurman with process id `parent` to exit, then put back anything it left.
-/// Solid text leaves apps almost invisible, so this covers Blurman being killed.
-pub fn watch(parent: u32) {
-    unsafe {
-        let Ok(process) = OpenProcess(PROCESS_SYNCHRONIZE, false, parent) else {
-            return;
-        };
-        WaitForSingleObject(process, INFINITE);
-        let _ = CloseHandle(process);
-    }
-    // A Blurman that exits normally has already cleaned up; a new one owns the state file.
-    std::thread::sleep(Duration::from_millis(500));
-    if ipc::find_host().is_none() {
-        restore_leftovers();
-    }
-}
-
 impl Engine {
-    fn new(shared: Arc<Shared>, host: HWND) -> Self {
+    fn new(shared: Arc<Shared>) -> Self {
         let prior: HashMap<isize, PersistedWindow> = rules::load_state()
             .into_iter()
             .map(|window| (window.hwnd, window))
@@ -196,14 +191,10 @@ impl Engine {
         persisted.sort_by_key(|window| window.hwnd);
         Self {
             shared,
-            host,
             glass: GlassSession::new(),
-            renderer: None,
             store: Store::default(),
-            settings: Settings::default(),
-            gaming: false,
-            watchdog: false,
             tracked: HashMap::new(),
+            early: HashMap::new(),
             prior,
             refused: HashMap::new(),
             persisted,
@@ -212,7 +203,6 @@ impl Engine {
 
     fn reload(&mut self) {
         self.store = rules::load();
-        self.settings = rules::load_settings();
         self.refused.clear();
         self.shared.set_status("");
         self.shared.rules_generation.fetch_add(1, Ordering::SeqCst);
@@ -224,7 +214,6 @@ impl Engine {
             self.restore_all();
             return;
         }
-        self.check_gaming();
 
         let wanted = target::windows_for_rules(&self.store.rules);
         let wanted_ids: HashSet<isize> = wanted.iter().map(|(window, _)| window.hwnd).collect();
@@ -262,9 +251,7 @@ impl Engine {
                 self.drop_tracked(window.hwnd);
             }
             if let Some(tracked) = self.tracked.get_mut(&window.hwnd) {
-                if sync_tracked(tracked, &window, &rule, &self.shared, self.renderer.as_ref()) {
-                    self.start_solid(window.hwnd);
-                }
+                sync_tracked(tracked, &window, &rule, &self.shared);
                 continue;
             }
             if self.refused.get(&window.hwnd) == Some(&(window.pid, window.process_start)) {
@@ -276,99 +263,20 @@ impl Engine {
                 self.refused.insert(key.0, (key.1, key.2));
             }
         }
+        let now = Instant::now();
+        let expired: Vec<isize> = self
+            .early
+            .iter()
+            .filter(|(hwnd, (_, since))| !wanted_ids.contains(hwnd) && now - *since > EARLY_WAIT)
+            .map(|(hwnd, _)| *hwnd)
+            .collect();
+        for hwnd in expired {
+            self.drop_early(hwnd);
+        }
         self.shared
             .fallback
             .store(self.glass.fallback(), Ordering::SeqCst);
-        // Catches frames whose notice arrived while the engine was busy.
-        let solid: Vec<isize> = self.tracked.iter().filter(|(_, t)| t.view.is_some()).map(|(k, _)| *k).collect();
-        for key in solid {
-            self.on_frame(key);
-        }
         self.persist();
-    }
-
-    /// Pause solid text while a fullscreen game is in front, unless the user opted in.
-    fn check_gaming(&mut self) {
-        let gaming = !self.settings.solid_text_in_fullscreen && target::fullscreen_in_front();
-        if gaming == self.gaming {
-            return;
-        }
-        self.gaming = gaming;
-        let solid: Vec<isize> = self.tracked.iter().filter(|(_, t)| t.solid_text).map(|(k, _)| *k).collect();
-        for key in solid {
-            if gaming {
-                if let Some(tracked) = self.tracked.get_mut(&key) {
-                    if let Err(err) = tracked.stop_solid(target::hwnd_of(key)) {
-                        self.shared.set_status(format!("{}: {err}", tracked.process));
-                    }
-                }
-            } else {
-                self.start_solid(key);
-            }
-        }
-    }
-
-    fn start_solid(&mut self, key: isize) {
-        if self.gaming || self.tracked.get(&key).is_none_or(|t| !t.solid_text || t.view.is_some()) {
-            return;
-        }
-        if self.renderer.is_none() {
-            match Renderer::new() {
-                Ok(renderer) => self.renderer = Some(renderer),
-                Err(err) => {
-                    self.shared.set_status(format!("Solid text is unavailable: {err}"));
-                    return;
-                }
-            }
-        }
-        let (Some(renderer), Some(tracked)) = (self.renderer.as_ref(), self.tracked.get_mut(&key)) else {
-            return;
-        };
-        let Some(compositor) = self.glass.compositor() else {
-            self.shared
-                .set_status("Solid text needs the adjustable blur, which this PC does not have.");
-            return;
-        };
-        let started = SolidView::start(renderer, compositor, target::hwnd_of(key), self.host).and_then(
-            |(view, surface)| {
-                tracked.pane.show_content(compositor, &surface)?;
-                Ok(view)
-            },
-        );
-        match started {
-            Ok(view) => {
-                tracked.view = Some(view);
-                if !self.watchdog {
-                    self.watchdog = ipc::spawn_watchdog();
-                }
-            }
-            Err(err) => self.shared.set_status(format!("{}: {err}", tracked.process)),
-        }
-    }
-
-    /// Draw the app's newest frame on its glass. The real window is hidden only once its copy
-    /// is on screen, so the app never disappears.
-    fn on_frame(&mut self, key: isize) {
-        let (Some(renderer), Some(tracked)) = (self.renderer.as_ref(), self.tracked.get_mut(&key)) else {
-            return;
-        };
-        let Some(view) = tracked.view.as_mut() else {
-            return;
-        };
-        let hwnd = target::hwnd_of(key);
-        let drawn = view
-            .draw(renderer, mapping::background_opacity(tracked.transparency), false)
-            .and_then(|drawn| {
-                if drawn && !tracked.hidden {
-                    target::set_alpha(hwnd, mapping::HIDDEN_ALPHA, false)?;
-                    tracked.hidden = true;
-                }
-                Ok(())
-            });
-        if let Err(err) = drawn {
-            self.shared.set_status(format!("{}: solid text stopped. {err}", tracked.process));
-            let _ = tracked.stop_solid(hwnd);
-        }
     }
 
     fn attach(&mut self, window: LiveWindow, rule: &Rule) -> Result<(), String> {
@@ -379,15 +287,17 @@ impl Engine {
             ));
         }
         let hwnd = target::hwnd_of(window.hwnd);
-        let saved = self
-            .prior
-            .remove(&window.hwnd)
-            .filter(|saved| saved.pid == window.pid && saved.process_start == window.process_start)
-            .map(|saved| saved.saved_style())
-            .unwrap_or_else(|| target::capture_style(hwnd));
-        let pane = self.glass.open(window.bounds, rule.blur)?;
+        let saved = self.original_style(window.hwnd, window.pid, window.process_start);
+        let pane = match self.glass.open(window.bounds, rule.blur) {
+            Ok(pane) => pane,
+            Err(err) => {
+                target::restore_alpha(hwnd, &saved);
+                return Err(err);
+            }
+        };
         if let Err(err) = target::apply_alpha(hwnd, rule.transparency, !saved.was_layered) {
             pane.close();
+            target::restore_alpha(hwnd, &saved);
             return Err(format!("{}: {err}", window.process));
         }
         let mut tracked = Tracked {
@@ -398,14 +308,57 @@ impl Engine {
             transparency: rule.transparency,
             blur: rule.blur,
             pane,
-            solid_text: rule.solid_text,
-            view: None,
-            hidden: false,
         };
         tracked.follow(hwnd);
         self.tracked.insert(window.hwnd, tracked);
-        self.start_solid(window.hwnd);
         Ok(())
+    }
+
+    /// The style `hwnd` had before any Blurman touched it: from the early fade, from an earlier
+    /// run, or as it is now.
+    fn original_style(&mut self, hwnd: isize, pid: u32, process_start: u64) -> SavedStyle {
+        let same = |saved: &PersistedWindow| saved.pid == pid && saved.process_start == process_start;
+        let early = self.early.remove(&hwnd).map(|(saved, _)| saved);
+        let prior = self.prior.remove(&hwnd);
+        early
+            .filter(same)
+            .or(prior.filter(same))
+            .map(|saved| saved.saved_style())
+            .unwrap_or_else(|| target::capture_style(target::hwnd_of(hwnd)))
+    }
+
+    /// Fade a window of a ruled app right away, before it is shown or titled, so it never
+    /// appears solid first. The glass follows once it qualifies as an app window.
+    fn fade_early(&mut self, hwnd: HWND) -> bool {
+        if target::is_minimized(hwnd) {
+            return false;
+        }
+        let Some(pid) = target::early_candidate(hwnd) else {
+            return false;
+        };
+        let Some(process) = target::process_name(pid) else {
+            return false;
+        };
+        let Some(transparency) = self
+            .store
+            .rules
+            .iter()
+            .find(|rule| rule.enabled && rule.process.eq_ignore_ascii_case(&process))
+            .map(|rule| rule.transparency)
+        else {
+            return false;
+        };
+        let key = hwnd.0 as isize;
+        let process_start = target::process_start(pid);
+        let saved = self.original_style(key, pid, process_start);
+        let nudge = !saved.was_layered && !target::is_out_of_view(hwnd);
+        if target::apply_alpha(hwnd, transparency, nudge).is_err() {
+            return false;
+        }
+        let window = PersistedWindow::new(key, pid, process_start, process, &saved);
+        self.early.insert(key, (window, Instant::now()));
+        self.persist();
+        true
     }
 
     fn on_event(&mut self, event: u32, hwnd: HWND) {
@@ -415,29 +368,43 @@ impl Engine {
                 if self.tracked.contains_key(&key) {
                     self.drop_tracked(key);
                     self.persist();
+                } else if self.early.remove(&key).is_some() {
+                    self.persist();
                 }
             }
             EVENT_SYSTEM_FOREGROUND => {
-                self.check_gaming();
                 for (hwnd, tracked) in &mut self.tracked {
                     tracked.follow(target::hwnd_of(*hwnd));
                 }
             }
-            // A new window of a ruled app is frosted the moment it appears, is restored, or gets
-            // its title, instead of on the next scan.
-            EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED | EVENT_OBJECT_NAMECHANGE | EVENT_SYSTEM_MINIMIZEEND
+            // New windows of ruled apps are faded as they are created and frosted the moment
+            // they appear, are restored, or get their title, instead of on the next scan.
+            EVENT_OBJECT_CREATE
+            | EVENT_OBJECT_SHOW
+            | EVENT_OBJECT_UNCLOAKED
+            | EVENT_OBJECT_NAMECHANGE
+            | EVENT_SYSTEM_MINIMIZEEND
                 if !self.tracked.contains_key(&key) =>
             {
-                if self.store.paused || self.refused.contains_key(&key) {
+                if self.store.paused
+                    || self.refused.contains_key(&key)
+                    || !self.store.rules.iter().any(|rule| rule.enabled)
+                {
                     return;
                 }
-                let ruled = target::frostable_process(hwnd).is_some_and(|process| {
-                    self.store
-                        .rules
-                        .iter()
-                        .any(|rule| rule.enabled && rule.process.eq_ignore_ascii_case(&process))
-                });
-                if ruled {
+                let faded = self.early.contains_key(&key)
+                    || (event != EVENT_OBJECT_NAMECHANGE && self.fade_early(hwnd));
+                let ready = if faded {
+                    target::is_frostable(hwnd)
+                } else {
+                    target::frostable_process(hwnd).is_some_and(|process| {
+                        self.store
+                            .rules
+                            .iter()
+                            .any(|rule| rule.enabled && rule.process.eq_ignore_ascii_case(&process))
+                    })
+                };
+                if ready {
                     self.reconcile();
                 }
             }
@@ -458,10 +425,22 @@ impl Engine {
         }
     }
 
+    fn drop_early(&mut self, hwnd: isize) {
+        if let Some((saved, _)) = self.early.remove(&hwnd) {
+            if target::window_alive(hwnd, saved.pid, saved.process_start) {
+                target::restore_alpha(target::hwnd_of(hwnd), &saved.saved_style());
+            }
+        }
+    }
+
     fn restore_all(&mut self) {
         let keys: Vec<isize> = self.tracked.keys().copied().collect();
         for hwnd in keys {
             self.drop_tracked(hwnd);
+        }
+        let keys: Vec<isize> = self.early.keys().copied().collect();
+        for hwnd in keys {
+            self.drop_early(hwnd);
         }
         for (_, saved) in self.prior.drain() {
             if target::window_alive(saved.hwnd, saved.pid, saved.process_start) {
@@ -476,15 +455,10 @@ impl Engine {
         let mut windows: Vec<PersistedWindow> = self
             .tracked
             .iter()
-            .map(|(hwnd, tracked)| PersistedWindow {
-                hwnd: *hwnd,
-                pid: tracked.pid,
-                process_start: tracked.process_start,
-                process: tracked.process.clone(),
-                original_exstyle: tracked.saved.exstyle,
-                original_layered: tracked.saved.was_layered,
-                original_alpha: tracked.saved.alpha,
+            .map(|(hwnd, tracked)| {
+                PersistedWindow::new(*hwnd, tracked.pid, tracked.process_start, tracked.process.clone(), &tracked.saved)
             })
+            .chain(self.early.values().map(|(saved, _)| saved.clone()))
             .chain(self.prior.values().cloned())
             .collect();
         windows.sort_by_key(|window| window.hwnd);
@@ -494,40 +468,12 @@ impl Engine {
     }
 }
 
-/// Apply rule edits to a window we already track. Returns true when solid text should start.
-fn sync_tracked(
-    tracked: &mut Tracked,
-    window: &LiveWindow,
-    rule: &Rule,
-    shared: &Shared,
-    renderer: Option<&Renderer>,
-) -> bool {
+fn sync_tracked(tracked: &mut Tracked, window: &LiveWindow, rule: &Rule, shared: &Shared) {
     let hwnd = target::hwnd_of(window.hwnd);
     if tracked.transparency != rule.transparency {
-        // A hidden window keeps its near-zero alpha; the slider only changes the drawn copy.
-        let applied = if tracked.hidden {
-            Ok(())
-        } else {
-            target::apply_alpha(hwnd, rule.transparency, false)
-        };
-        match applied {
+        match target::apply_alpha(hwnd, rule.transparency, false) {
             Ok(()) => tracked.transparency = rule.transparency,
             Err(err) => shared.set_status(format!("{}: {err}", window.process)),
-        }
-        if let (Some(view), Some(renderer)) = (tracked.view.as_mut(), renderer) {
-            let opacity = mapping::background_opacity(tracked.transparency);
-            if let Err(err) = view.draw(renderer, opacity, true) {
-                shared.set_status(format!("{}: {err}", window.process));
-            }
-        }
-    }
-    let mut start_solid = false;
-    if tracked.solid_text != rule.solid_text {
-        tracked.solid_text = rule.solid_text;
-        if rule.solid_text {
-            start_solid = true;
-        } else if let Err(err) = tracked.stop_solid(hwnd) {
-            shared.set_status(format!("{}: {err}", window.process));
         }
     }
     if tracked.blur != rule.blur {
@@ -537,14 +483,13 @@ fn sync_tracked(
         }
     }
     tracked.follow(hwnd);
-    start_solid
 }
 
 fn install_hooks() -> Vec<HWINEVENTHOOK> {
     let ranges = [
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
-        (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
+        (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE),
         (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
     ];
@@ -577,7 +522,7 @@ unsafe extern "system" fn on_win_event(
     if hwnd.0.is_null() || id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 {
         return;
     }
-    with_engine(|engine| engine.on_event(event, hwnd));
+    queue_event(event, hwnd.0 as isize);
 }
 
 fn create_host() -> Result<HWND, String> {

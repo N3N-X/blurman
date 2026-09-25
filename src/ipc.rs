@@ -44,21 +44,6 @@ pub fn show_running() -> bool {
     signal(msg_show())
 }
 
-/// Start a helper that puts apps back if this Blurman is killed. Returns true if it started.
-pub fn spawn_watchdog() -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    Command::new(exe)
-        .args(["watchdog", &std::process::id().to_string()])
-        .creation_flags(DETACHED_PROCESS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .is_ok()
-}
-
 /// Tell a running Blurman to reload the rules, or open Blurman if none is running.
 pub fn reload_or_launch() -> Result<(), String> {
     if signal(msg_reload()) {

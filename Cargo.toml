@@ -1,0 +1,48 @@
+[package]
+name = "blurman"
+version = "0.1.0"
+edition = "2021"
+description = "Frosted glass behind the Windows apps you pick"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = "0.31"
+raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tray-icon = "0.19"
+windows-collections = "0.2"
+windows-core = "0.61"
+windows-numerics = "0.2"
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Foundation_Numerics",
+    "Graphics_Effects",
+    "System",
+    "UI_Composition",
+    "UI_Composition_Desktop",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Graphics_Direct2D",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

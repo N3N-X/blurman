@@ -14,8 +14,7 @@ use windows::UI::Composition::{
 };
 use windows::Win32::Foundation::{E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND, DWMWINDOWATTRIBUTE,
+    DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
@@ -153,6 +152,8 @@ impl GlassSession {
             hwnd,
             visuals: None,
             topmost: None,
+            placed: None,
+            corner: None,
         };
         if let Some(composition) = &self.composition {
             match attach_gaussian(composition, hwnd, blur) {
@@ -185,6 +186,10 @@ pub struct GlassPane {
     visuals: Option<Visuals>,
     /// Which z-order band the pane is in, or None while it is hidden.
     topmost: Option<bool>,
+    /// Bounds last given to SetWindowPos. Used to skip a DWM query when nothing moved.
+    placed: Option<RECT>,
+    /// Corner preference already applied, so a still pane is not written again.
+    corner: Option<i32>,
 }
 
 impl GlassPane {
@@ -200,35 +205,69 @@ impl GlassPane {
             .map_err(|err| err.to_string())
     }
 
+    /// True when the pane is hidden, in the wrong topmost band, or no longer directly under `target`.
+    /// Uses the last placed bounds, so a still window does not need a DWM frame query.
+    pub fn needs_place(&self, target: HWND, topmost: bool) -> bool {
+        let Some(bounds) = self.placed else {
+            return true;
+        };
+        self.topmost != Some(topmost) || !self.sits_under(target, bounds)
+    }
+
     /// Size the pane to `bounds` and put it directly beneath `target` in the z-order.
     pub fn place_under(&mut self, target: HWND, bounds: RECT, topmost: bool) {
-        if self.topmost == Some(topmost) && self.sits_under(target, bounds) {
-            return;
-        }
-        unsafe {
-            if topmost != self.topmost.unwrap_or(false) {
-                let band = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        if self.topmost != Some(topmost) || !self.sits_under(target, bounds) {
+            unsafe {
+                if topmost != self.topmost.unwrap_or(false) {
+                    let band = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        Some(band),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
                 let _ = SetWindowPos(
                     self.hwnd,
-                    Some(band),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    Some(target),
+                    bounds.left,
+                    bounds.top,
+                    (bounds.right - bounds.left).max(1),
+                    (bounds.bottom - bounds.top).max(1),
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
             }
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(target),
-                bounds.left,
-                bounds.top,
-                (bounds.right - bounds.left).max(1),
-                (bounds.bottom - bounds.top).max(1),
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
+            self.topmost = Some(topmost);
         }
-        self.topmost = Some(topmost);
+        self.placed = Some(bounds);
+        self.sync_corner(target);
+    }
+
+    /// Copy the target's corner preference. Windows 10 has no preference, so a failed read leaves
+    /// the pane on the system default instead of forcing a round corner.
+    fn sync_corner(&mut self, target: HWND) {
+        let Some(preference) = crate::target::corner_preference(target) else {
+            return;
+        };
+        if self.corner == Some(preference) {
+            return;
+        }
+        let value = preference;
+        let ok = unsafe {
+            DwmSetWindowAttribute(
+                self.hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &value as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            )
+            .is_ok()
+        };
+        if ok {
+            self.corner = Some(preference);
+        }
     }
 
     /// Checks the real window rather than a cached position, so outside moves get corrected.
@@ -243,6 +282,7 @@ impl GlassPane {
     }
 
     pub fn hide(&mut self) {
+        self.placed = None;
         if self.topmost.take().is_some() {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -342,15 +382,6 @@ fn create_glass_window(bounds: RECT) -> Result<HWND, String> {
         )
     }
     .map_err(|err| format!("Could not create the glass window: {err}"))?;
-    let corner = DWMWCP_ROUND;
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corner as *const _ as *const std::ffi::c_void,
-            std::mem::size_of_val(&corner) as u32,
-        );
-    }
     Ok(hwnd)
 }
 

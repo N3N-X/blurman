@@ -23,6 +23,10 @@ pub fn msg_shutdown() -> u32 {
     unsafe { RegisterWindowMessageW(windows::core::w!("Blurman.Shutdown")) }
 }
 
+pub fn msg_tweak() -> u32 {
+    unsafe { RegisterWindowMessageW(windows::core::w!("Blurman.Tweak")) }
+}
+
 pub fn find_host() -> Option<HWND> {
     unsafe { FindWindowW(HOST_CLASS, HOST_CLASS) }
         .ok()

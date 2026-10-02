@@ -8,6 +8,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, PostThreadMessageW, SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW,
 };
 
+/// A slider change to apply on the panes already tracking `process`. Not a full reload.
+#[derive(Clone)]
+pub struct Tweak {
+    pub process: String,
+    pub transparency: u8,
+    pub blur: u8,
+}
+
 pub struct Shared {
     pub fallback: AtomicBool,
     /// The effect thread's hidden host window.
@@ -23,6 +31,8 @@ pub struct Shared {
     pub rules_generation: AtomicU64,
     pub worker_done: AtomicBool,
     status: Mutex<String>,
+    /// Slider edits waiting for the effect thread. One slot per process; a newer drag replaces it.
+    tweaks: Mutex<Vec<Tweak>>,
 }
 
 impl Shared {
@@ -37,7 +47,26 @@ impl Shared {
             rules_generation: AtomicU64::new(0),
             worker_done: AtomicBool::new(false),
             status: Mutex::new(String::new()),
+            tweaks: Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn push_tweak(&self, tweak: Tweak) {
+        let Ok(mut tweaks) = self.tweaks.lock() else {
+            return;
+        };
+        if let Some(existing) = tweaks
+            .iter_mut()
+            .find(|item| item.process.eq_ignore_ascii_case(&tweak.process))
+        {
+            *existing = tweak;
+        } else {
+            tweaks.push(tweak);
+        }
+    }
+
+    pub fn take_tweaks(&self) -> Vec<Tweak> {
+        self.tweaks.lock().map(|mut tweaks| std::mem::take(&mut *tweaks)).unwrap_or_default()
     }
 
     pub fn set_ctx(&self, ctx: Option<egui::Context>) {

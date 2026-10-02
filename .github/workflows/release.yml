@@ -1,0 +1,51 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: blurman
+          path: target/release/blurman.exe
+
+      - name: Release tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: tag
+        shell: pwsh
+        run: |
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $match.Matches.Groups[1].Value
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          "tag=v$version-$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
+          "name=Blurman $version ($sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8NoBOM
+
+      - name: Publish GitHub release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.name }}
+          files: target/release/blurman.exe
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true

@@ -9,10 +9,11 @@ use windows::Win32::Foundation::{
     WIN32_ERROR,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
+    GetMonitorInfoW, MonitorFromWindow, RedrawWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -42,6 +43,8 @@ pub struct LiveWindow {
     pub elevated: bool,
     /// On another virtual desktop, or hidden by the shell.
     pub cloaked: bool,
+    /// Covers the whole monitor. A maximized window stops above the taskbar, so it is not fullscreen.
+    pub fullscreen: bool,
     pub bounds: RECT,
 }
 
@@ -51,23 +54,30 @@ pub struct AppGroup {
     pub sample_title: String,
     pub windows: usize,
     pub elevated: bool,
+    /// Every visible window of this app covers its monitor.
+    pub fullscreen: bool,
 }
 
 pub fn list_groups() -> Vec<AppGroup> {
+    let mut windows: Vec<LiveWindow> = visible_windows().into_iter().filter(|window| !window.cloaked).collect();
+    // The list only needs the admin badge. Start times are for the effect thread.
+    enrich(&mut windows, false, true);
     let mut groups: Vec<AppGroup> = Vec::new();
-    for window in enumerate_windows().into_iter().filter(|window| !window.cloaked) {
+    for window in windows {
         if let Some(group) = groups
             .iter_mut()
             .find(|group| group.process.eq_ignore_ascii_case(&window.process))
         {
             group.windows += 1;
             group.elevated |= window.elevated;
+            group.fullscreen &= window.fullscreen;
         } else {
             groups.push(AppGroup {
                 process: window.process,
                 sample_title: window.title,
                 windows: 1,
                 elevated: window.elevated,
+                fullscreen: window.fullscreen,
             });
         }
     }
@@ -75,20 +85,49 @@ pub fn list_groups() -> Vec<AppGroup> {
     groups
 }
 
-pub fn windows_for_rules(rules: &[Rule]) -> Vec<(LiveWindow, Rule)> {
+/// Windows a rule wants frosted, plus rules whose open windows are all fullscreen.
+pub struct RuledWindows {
+    pub wanted: Vec<(LiveWindow, Rule)>,
+    pub fullscreen_only: Vec<String>,
+}
+
+pub fn windows_for_rules(rules: &[Rule]) -> RuledWindows {
     let enabled: Vec<&Rule> = rules.iter().filter(|rule| rule.enabled).collect();
     if enabled.is_empty() {
-        return Vec::new();
+        return RuledWindows {
+            wanted: Vec::new(),
+            fullscreen_only: Vec::new(),
+        };
     }
-    enumerate_windows()
-        .into_iter()
-        .filter_map(|window| {
-            enabled
-                .iter()
-                .find(|rule| rule.process.eq_ignore_ascii_case(&window.process))
-                .map(|rule| (window, (*rule).clone()))
-        })
-        .collect()
+    let mut windows = visible_windows();
+    windows.retain(|window| {
+        enabled
+            .iter()
+            .any(|rule| rule.process.eq_ignore_ascii_case(&window.process))
+    });
+    // OpenProcess only for the executables that have a rule, not every window on the desktop.
+    enrich(&mut windows, true, true);
+    let mut wanted = Vec::new();
+    let mut fullscreen_only = Vec::new();
+    for rule in enabled {
+        let mut any = false;
+        let mut any_normal = false;
+        for window in windows
+            .iter()
+            .filter(|window| rule.process.eq_ignore_ascii_case(&window.process))
+        {
+            any = true;
+            if window.fullscreen {
+                continue;
+            }
+            any_normal = true;
+            wanted.push((window.clone(), rule.clone()));
+        }
+        if any && !any_normal {
+            fullscreen_only.push(rule.process.clone());
+        }
+    }
+    RuledWindows { wanted, fullscreen_only }
 }
 
 struct ProcessInfo {
@@ -96,7 +135,8 @@ struct ProcessInfo {
     elevated: bool,
 }
 
-pub fn enumerate_windows() -> Vec<LiveWindow> {
+/// Visible top-level windows with process names filled in. Does not open any process.
+fn visible_windows() -> Vec<LiveWindow> {
     let mut found: Vec<LiveWindow> = Vec::new();
     unsafe {
         let param = LPARAM(&mut found as *mut Vec<LiveWindow> as isize);
@@ -108,20 +148,33 @@ pub fn enumerate_windows() -> Vec<LiveWindow> {
         return found;
     }
     let names = process_names();
-    let mut info: HashMap<u32, ProcessInfo> = HashMap::new();
     for window in &mut found {
-        let process = info.entry(window.pid).or_insert_with(|| ProcessInfo {
-            start: process_start(window.pid),
-            elevated: is_elevated(window.pid),
-        });
-        window.process_start = process.start;
-        window.elevated = process.elevated;
         window.process = names
             .get(&window.pid)
             .cloned()
             .unwrap_or_else(|| format!("pid-{}", window.pid));
     }
     found
+}
+
+/// Fill start time and elevation for the processes already in `windows`. One open per process.
+fn enrich(windows: &mut [LiveWindow], start: bool, elevated: bool) {
+    if windows.is_empty() || (!start && !elevated) {
+        return;
+    }
+    let mut info: HashMap<u32, ProcessInfo> = HashMap::new();
+    for window in windows {
+        let process = info.entry(window.pid).or_insert_with(|| ProcessInfo {
+            start: if start { process_start(window.pid) } else { 0 },
+            elevated: if elevated { is_elevated(window.pid) } else { false },
+        });
+        if start {
+            window.process_start = process.start;
+        }
+        if elevated {
+            window.elevated = process.elevated;
+        }
+    }
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -156,8 +209,9 @@ fn inspect_window(hwnd: HWND) -> Option<LiveWindow> {
             return None;
         }
         let bounds = frame_bounds(hwnd);
+        let iconic = IsIconic(hwnd).as_bool();
         // A minimized window keeps its glass hidden but stays faded, so it restores already frosted.
-        if !IsIconic(hwnd).as_bool() && (bounds.right - bounds.left < 160 || bounds.bottom - bounds.top < 90) {
+        if !iconic && (bounds.right - bounds.left < 160 || bounds.bottom - bounds.top < 90) {
             return None;
         }
         let mut pid = 0u32;
@@ -165,6 +219,7 @@ fn inspect_window(hwnd: HWND) -> Option<LiveWindow> {
         if pid == 0 {
             return None;
         }
+        let cloaked = is_cloaked(hwnd);
         Some(LiveWindow {
             hwnd: hwnd.0 as isize,
             pid,
@@ -172,9 +227,70 @@ fn inspect_window(hwnd: HWND) -> Option<LiveWindow> {
             process: String::new(),
             title,
             elevated: false,
-            cloaked: is_cloaked(hwnd),
+            cloaked,
+            fullscreen: !iconic && !cloaked && covers_its_monitor(hwnd, bounds),
             bounds,
         })
+    }
+}
+
+/// How far a window edge may sit inside the monitor and still count as covering it.
+const MONITOR_SLOP: i32 = 8;
+
+/// True when every edge of `bounds` reaches the monitor, within [`MONITOR_SLOP`].
+/// A maximized window stops at the taskbar, so its bottom (or side) falls short of `rcMonitor`.
+pub(crate) fn covers_monitor(bounds: RECT, monitor: RECT) -> bool {
+    bounds.left <= monitor.left + MONITOR_SLOP
+        && bounds.top <= monitor.top + MONITOR_SLOP
+        && bounds.right >= monitor.right - MONITOR_SLOP
+        && bounds.bottom >= monitor.bottom - MONITOR_SLOP
+}
+
+fn covers_its_monitor(hwnd: HWND, bounds: RECT) -> bool {
+    monitor_rect(hwnd).is_some_and(|monitor| covers_monitor(bounds, monitor))
+}
+
+fn monitor_rect(hwnd: HWND) -> Option<RECT> {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: RECT::default(),
+            rcWork: RECT::default(),
+            dwFlags: 0,
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+        Some(info.rcMonitor)
+    }
+}
+
+/// Visible, not minimized, and covering the monitor it is on.
+pub fn is_fullscreen(hwnd: HWND) -> bool {
+    unsafe {
+        if IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) {
+            return false;
+        }
+    }
+    covers_its_monitor(hwnd, frame_bounds(hwnd))
+}
+
+/// The window's corner preference, or None where Windows has no such attribute (Windows 10).
+pub fn corner_preference(hwnd: HWND) -> Option<i32> {
+    unsafe {
+        let mut preference = 0i32;
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &mut preference as *mut i32 as *mut std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        )
+        .ok()?;
+        Some(preference)
     }
 }
 
@@ -272,6 +388,10 @@ pub fn early_candidate(hwnd: HWND) -> Option<u32> {
         }
         let mut rect = RECT::default();
         if GetWindowRect(hwnd, &mut rect).is_err() || rect.right - rect.left < 160 || rect.bottom - rect.top < 90 {
+            return None;
+        }
+        // A window created already covering the monitor is a fullscreen app. Leave it solid.
+        if covers_its_monitor(hwnd, rect) {
             return None;
         }
         let mut pid = 0u32;
@@ -470,6 +590,33 @@ pub fn restore_alpha(hwnd: HWND, saved: &SavedStyle) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT { left, top, right, bottom }
+    }
+
+    #[test]
+    fn fullscreen_covers_the_monitor_and_maximized_does_not() {
+        let monitor = rect(0, 0, 1920, 1080);
+        assert!(covers_monitor(rect(0, 0, 1920, 1080), monitor));
+        assert!(covers_monitor(rect(-4, -4, 1924, 1084), monitor));
+        // A few pixels short on every edge still counts. The taskbar gap does not.
+        assert!(covers_monitor(rect(2, 2, 1916, 1074), monitor));
+        assert!(!covers_monitor(rect(0, 0, 1920, 1040), monitor));
+        assert!(!covers_monitor(rect(100, 100, 1100, 800), monitor));
+    }
+
+    #[test]
+    fn a_window_on_a_second_monitor_uses_that_monitor() {
+        let monitor = rect(1920, 0, 3840, 1080);
+        assert!(covers_monitor(rect(1920, 0, 3840, 1080), monitor));
+        assert!(!covers_monitor(rect(0, 0, 1920, 1080), monitor));
     }
 }
 

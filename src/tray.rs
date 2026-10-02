@@ -94,7 +94,7 @@ fn build(paused: bool) -> Result<Tray, String> {
     let menu = Menu::new();
     menu.append_items(&[&open, &pause, &PredefinedMenuItem::separator(), &exit])
         .map_err(|err| err.to_string())?;
-    let icon = crate::app::icon_rgba();
+    let icon = crate::app::tray_icon();
     let icon = tray_icon::Icon::from_rgba(icon.rgba, icon.width, icon.height)
         .map_err(|err| err.to_string())?;
     let icon = TrayIconBuilder::new()

@@ -14,6 +14,7 @@ Frosted glass behind the Windows apps you pick. Chrome, Edge, Electron apps, Not
 - **Pause** puts every app back without deleting rules. **Restore all** deletes them.
 - **Start with Windows** runs Blurman quietly in the tray at sign-in. **Keep in tray on close** does the same for normal launches, so apps stay frosted while the window is closed.
 - Glass follows the app as you move, resize, minimize, or switch virtual desktops.
+- Fullscreen windows are left alone, so a game or a video that covers the screen is not faded.
 - If Blurman crashes or is killed, the next start (or `blurman clear --all`) puts every app back.
 
 ## Requirements
@@ -21,6 +22,10 @@ Frosted glass behind the Windows apps you pick. Chrome, Edge, Electron apps, Not
 - Windows 11 for adjustable blur. Windows 10 works with system acrylic, where the blur slider sets how milky the glass is.
 - [Rust](https://rustup.rs) stable, with the MSVC toolchain (`stable-x86_64-pc-windows-msvc`, the rustup default on Windows).
 - Visual Studio Build Tools with the **Desktop development with C++** workload, which provides the MSVC linker and Windows SDK. rustup offers to install it if it is missing.
+
+## Download
+
+Each push to `main` builds `blurman.exe` and publishes it on the [releases page](https://github.com/N3N-X/blurman/releases). The file is not signed, so Windows SmartScreen may warn the first time you open it.
 
 ## Build
 

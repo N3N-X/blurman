@@ -4,7 +4,7 @@ use crate::autostart;
 use crate::ipc;
 use crate::mapping::{self, BLUR_DEFAULT, TRANSPARENCY_DEFAULT};
 use crate::rules::{self, Rule, Settings, Store};
-use crate::shared::Shared;
+use crate::shared::{Shared, Tweak};
 use crate::target::{self, AppGroup};
 use crate::theme::{self, ACCENT, CARD_STROKE, MUTED, ROW, ROW_HOVER, ROW_SELECTED, TEXT, WARN};
 use crate::tray;
@@ -22,6 +22,8 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Controls::MARGINS;
 
 const RESCAN: Duration = Duration::from_secs(1);
+/// How long a slider may sit still, while the button is held, before the rules file is written.
+const SAVE_AFTER: Duration = Duration::from_millis(80);
 
 /// Show the window, and while Blurman sits in the tray, close it for real. eframe spins a CPU
 /// core when its window is merely hidden, so the tray waits on plain Win32 messages instead.
@@ -52,7 +54,7 @@ fn open_window(shared: &Arc<Shared>, tray_session: bool) -> Result<(), String> {
             .with_inner_size([560.0, 800.0])
             .with_min_inner_size([480.0, 600.0])
             .with_transparent(true)
-            .with_icon(icon_rgba()),
+            .with_icon(window_icon()),
         ..Default::default()
     };
     let app_shared = shared.clone();
@@ -69,7 +71,13 @@ fn open_window(shared: &Arc<Shared>, tray_session: bool) -> Result<(), String> {
                     glass = frost_window(HWND(win32.hwnd.get() as *mut _));
                 }
             }
-            Ok(Box::new(BlurmanApp::new(app_shared, settings, tray_session, glass)))
+            Ok(Box::new(BlurmanApp::new(
+                app_shared,
+                settings,
+                tray_session,
+                glass,
+                &cc.egui_ctx,
+            )))
         }),
     )
     .map_err(|err| err.to_string());
@@ -113,10 +121,13 @@ struct BlurmanApp {
     startup: bool,
     /// The window has a frosted backdrop showing through wherever nothing is drawn.
     glass: bool,
+    logo: egui::TextureHandle,
+    /// When a slider edit should be written. None while the file matches the sliders.
+    pending_save: Option<Instant>,
 }
 
 impl BlurmanApp {
-    fn new(shared: Arc<Shared>, settings: Settings, startup: bool, glass: bool) -> Self {
+    fn new(shared: Arc<Shared>, settings: Settings, startup: bool, glass: bool, ctx: &egui::Context) -> Self {
         let store = rules::load();
         let tray_error = tray::sync(settings.close_to_tray || startup, store.paused).err();
         Self {
@@ -134,6 +145,8 @@ impl BlurmanApp {
             blur: BLUR_DEFAULT,
             startup,
             glass,
+            pending_save: None,
+            logo: load_logo(ctx),
         }
     }
 
@@ -171,12 +184,47 @@ impl BlurmanApp {
     }
 
     fn publish(&mut self) {
+        self.pending_save = None;
         self.store.normalize();
         if let Err(err) = rules::save(&self.store) {
             self.shared.set_status(format!("Could not save rules: {err}"));
             return;
         }
         ipc::signal(ipc::msg_reload());
+    }
+
+    /// Push a slider change to the panes now. The file is written once the drag settles.
+    fn live_rule(&mut self, process: &str) {
+        let Some(rule) = self.store.rule(process) else {
+            return;
+        };
+        self.shared.push_tweak(Tweak {
+            process: rule.process.clone(),
+            transparency: rule.transparency,
+            blur: rule.blur,
+        });
+        ipc::signal(ipc::msg_tweak());
+        self.pending_save = Some(Instant::now() + SAVE_AFTER);
+    }
+
+    fn flush_rules_file(&mut self) {
+        self.pending_save = None;
+        self.store.normalize();
+        if let Err(err) = rules::save(&self.store) {
+            self.shared.set_status(format!("Could not save rules: {err}"));
+        }
+    }
+
+    /// Write the rules file once a drag ends, or about 80 ms after the last movement.
+    fn settle_save(&mut self, pointer_down: bool) -> Duration {
+        let Some(deadline) = self.pending_save else {
+            return RESCAN;
+        };
+        if pointer_down && deadline > Instant::now() {
+            return deadline.saturating_duration_since(Instant::now()).min(RESCAN);
+        }
+        self.flush_rules_file();
+        RESCAN
     }
 
     fn frost_selected(&mut self) {
@@ -204,10 +252,7 @@ impl BlurmanApp {
     fn header(&mut self, ui: &mut Ui) {
         let roomy = ui.available_width() >= 500.0;
         ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), Sense::hover());
-            let painter = ui.painter();
-            painter.circle_filled(rect.center(), 16.0, Color32::from_rgb(58, 96, 132));
-            painter.circle_filled(rect.center(), 12.0, Color32::from_rgb(176, 214, 232));
+            ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(34.0, 34.0)));
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.heading(RichText::new("Blurman").strong().color(TEXT));
@@ -341,7 +386,15 @@ impl BlurmanApp {
                     ui.end_row();
                 });
             if ruled && moved {
-                self.frost_selected();
+                let was_enabled = self.selected_rule().is_some_and(|rule| rule.enabled);
+                if self.store.paused || !was_enabled {
+                    // Enabling, or waking from pause, has to attach panes. A pure slider edit does not.
+                    self.frost_selected();
+                } else if let Some(process) = self.selected.clone() {
+                    self.store
+                        .upsert(rules::new_rule(&process, self.transparency, self.blur));
+                    self.live_rule(&process);
+                }
             }
             ui.add_space(6.0);
             ui.add_enabled_ui(self.selected.is_some(), |ui| {
@@ -360,7 +413,8 @@ impl BlurmanApp {
     }
 
     fn saved_rules(&mut self, ui: &mut Ui) {
-        let mut changed = false;
+        let mut structural = false;
+        let mut tweaked = Vec::new();
         let mut delete = None;
         let mut pause = None;
         let mut restore_all = false;
@@ -400,7 +454,7 @@ impl BlurmanApp {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            changed |= theme::toggle(ui, &mut rule.enabled)
+                            structural |= theme::toggle(ui, &mut rule.enabled)
                                 .on_hover_text("Turn this rule on or off.")
                                 .changed();
                             let color = if rule.enabled { TEXT } else { MUTED };
@@ -416,39 +470,45 @@ impl BlurmanApp {
                             ui.spacing_mut().slider_width =
                                 ((ui.available_width() - 290.0) / 2.0).clamp(60.0, 180.0);
                             ui.label(theme::muted("Transparency").small());
-                            changed |= ui
-                                .add(
-                                    Slider::new(
-                                        &mut rule.transparency,
-                                        mapping::TRANSPARENCY_MIN..=mapping::TRANSPARENCY_MAX,
-                                    )
-                                    .suffix("%"),
+                            let transparency = ui.add(
+                                Slider::new(
+                                    &mut rule.transparency,
+                                    mapping::TRANSPARENCY_MIN..=mapping::TRANSPARENCY_MAX,
                                 )
-                                .changed();
+                                .suffix("%"),
+                            );
                             ui.add_space(6.0);
                             ui.label(theme::muted("Blur").small());
-                            changed |= ui
-                                .add(Slider::new(&mut rule.blur, mapping::BLUR_MIN..=mapping::BLUR_MAX))
-                                .changed();
+                            let blur = ui.add(Slider::new(&mut rule.blur, mapping::BLUR_MIN..=mapping::BLUR_MAX));
+                            if (transparency.changed() || blur.changed())
+                                && !tweaked.iter().any(|item: &String| item == &rule.process)
+                            {
+                                tweaked.push(rule.process.clone());
+                            }
                         });
                     });
             }
         });
         if let Some(process) = delete {
             self.store.remove(&process);
-            changed = true;
+            structural = true;
         }
         if restore_all {
             self.store.clear();
-            changed = true;
+            structural = true;
         }
         if let Some(paused) = pause {
             self.store.paused = paused;
-            changed = true;
+            structural = true;
         }
-        if changed {
+        if structural {
             self.sliders_from_rule();
             self.publish();
+        } else if !tweaked.is_empty() {
+            self.sliders_from_rule();
+            for process in tweaked {
+                self.live_rule(&process);
+            }
         }
     }
 
@@ -520,9 +580,14 @@ impl eframe::App for BlurmanApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(RESCAN);
-        if ctx.input(|input| input.viewport().close_requested()) && self.keeps_in_tray() {
-            self.shared.to_tray.store(true, Ordering::SeqCst);
+        if ctx.input(|input| input.viewport().close_requested()) {
+            // A drag can end by closing the window, before the settle timer writes the file.
+            if self.pending_save.is_some() {
+                self.flush_rules_file();
+            }
+            if self.keeps_in_tray() {
+                self.shared.to_tray.store(true, Ordering::SeqCst);
+            }
         }
         self.sync_from_disk();
         if self.scanned.elapsed() >= RESCAN {
@@ -560,6 +625,8 @@ impl eframe::App for BlurmanApp {
                         ui.add_space(8.0);
                     });
             });
+        let pointer_down = ctx.input(|input| input.pointer.any_down());
+        ctx.request_repaint_after(self.settle_save(pointer_down));
     }
 }
 
@@ -601,6 +668,9 @@ fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -
                     if let Some(rule) = rule {
                         theme::badge(ui, &format!("Frosted · {}%", rule.transparency), ACCENT);
                     }
+                    if group.fullscreen {
+                        theme::badge(ui, "Fullscreen", WARN);
+                    }
                     if group.elevated {
                         theme::badge(ui, "Admin", WARN);
                     }
@@ -608,9 +678,12 @@ fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -
             });
         });
     let rect = inner.response.rect;
-    let response = ui
+    let mut response = ui
         .interact(rect, ui.id().with(("app", &group.process)), Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand);
+    if group.fullscreen {
+        response = response.on_hover_text("This app covers the screen, so Blurman leaves it alone.");
+    }
     let fill = if selected {
         ROW_SELECTED
     } else if response.hovered() {
@@ -639,27 +712,29 @@ fn setting_row(ui: &mut Ui, title: &str, description: &str, on: &mut bool) -> bo
     changed
 }
 
-pub fn icon_rgba() -> egui::IconData {
-    let size = 32i32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let (dx, dy) = (x - 16, y - 16);
-            let distance = dx * dx + dy * dy;
-            let pixel = if distance <= 11 * 11 {
-                [176, 214, 232, 255]
-            } else if distance <= 15 * 15 {
-                [58, 96, 132, 255]
-            } else {
-                continue;
-            };
-            let index = ((y * size + x) * 4) as usize;
-            rgba[index..index + 4].copy_from_slice(&pixel);
-        }
-    }
+fn decode_icon(bytes: &[u8]) -> egui::IconData {
+    let image = image::load_from_memory(bytes).expect("app icon");
+    let rgba = image.to_rgba8();
     egui::IconData {
-        rgba,
-        width: size as u32,
-        height: size as u32,
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
     }
+}
+
+pub fn window_icon() -> egui::IconData {
+    decode_icon(include_bytes!("../assets/icon-256.png"))
+}
+
+pub fn tray_icon() -> egui::IconData {
+    decode_icon(include_bytes!("../assets/icon-32.png"))
+}
+
+fn load_logo(ctx: &egui::Context) -> egui::TextureHandle {
+    let icon = decode_icon(include_bytes!("../assets/icon-64.png"));
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    ctx.load_texture("blurman-logo", image, egui::TextureOptions::LINEAR)
 }

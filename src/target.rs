@@ -9,7 +9,8 @@ use windows::Win32::Foundation::{
     WIN32_ERROR,
 };
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, RedrawWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -550,8 +551,24 @@ pub fn apply_alpha(hwnd: HWND, transparency: u8, nudge: bool) -> Result<(), Stri
             }
         }
         let alpha = mapping::transparency_to_alpha(transparency);
-        SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).map_err(|err| err.to_string())
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).map_err(|err| err.to_string())?;
+        // A faded window keeps a picture of itself. Without this, that picture stays painted
+        // on top for a frame after you switch away.
+        set_transitions_disabled(hwnd, true);
+        Ok(())
     }
+}
+
+fn set_transitions_disabled(hwnd: HWND, disabled: bool) {
+    let disabled = BOOL::from(disabled);
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &disabled as *const BOOL as *const std::ffi::c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        )
+    };
 }
 
 /// Some apps paint black after gaining the layered bit until they are resized.
@@ -575,6 +592,7 @@ pub fn restore_alpha(hwnd: HWND, saved: &SavedStyle) {
         if !IsWindow(Some(hwnd)).as_bool() || IsHungAppWindow(hwnd).as_bool() {
             return;
         }
+        set_transitions_disabled(hwnd, false);
         match mapping::restore_action(saved) {
             RestoreAction::KeepLayered { alpha } => {
                 let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);

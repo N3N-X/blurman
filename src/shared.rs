@@ -1,5 +1,6 @@
 //! State shared by the window, the tray, and the effect thread.
 
+use crate::mapping::BlurStyle;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,6 +15,7 @@ pub struct Tweak {
     pub process: String,
     pub transparency: u8,
     pub blur: u8,
+    pub style: BlurStyle,
 }
 
 pub struct Shared {

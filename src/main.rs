@@ -45,6 +45,9 @@ enum Command {
         #[arg(long, default_value_t = mapping::BLUR_DEFAULT,
               value_parser = clap::value_parser!(u8).range(mapping::BLUR_MIN as i64..=mapping::BLUR_MAX as i64))]
         blur: u8,
+        /// Frost blurs what is behind the window. Acrylic is milky system glass, and the blur value sets how milky it is.
+        #[arg(long, value_enum, default_value_t = mapping::BlurStyle::Frost)]
+        style: mapping::BlurStyle,
     },
     /// Take the glass off one app, or every app with --all.
     Clear {
@@ -97,8 +100,9 @@ fn run_command(command: Command) -> Result<(), String> {
             process,
             transparency,
             blur,
+            style,
         } => {
-            let rule = rules::new_rule(&process, transparency, blur);
+            let rule = rules::new_rule(&process, transparency, blur, style);
             if rule.process.is_empty() {
                 return Err("Give an app name, like chrome.exe.".into());
             }
@@ -108,8 +112,8 @@ fn run_command(command: Command) -> Result<(), String> {
             rules::save(&store)?;
             ipc::reload_or_launch()?;
             println!(
-                "Frosting {} at transparency {} and blur {}.",
-                rule.process, rule.transparency, rule.blur
+                "Frosting {} at transparency {} with {} {}.",
+                rule.process, rule.transparency, rule.style, rule.blur
             );
         }
         Command::Clear { process, all } => {

@@ -1,6 +1,6 @@
 //! Rules the user asked for, plus the original style of every window we touched.
 
-use crate::mapping::{self, SavedStyle};
+use crate::mapping::{self, BlurStyle, SavedStyle};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,9 @@ pub struct Rule {
     pub process: String,
     pub transparency: u8,
     pub blur: u8,
+    /// Frost or acrylic. Omitted in rules saved before the choice existed, which means frost.
+    #[serde(default)]
+    pub style: BlurStyle,
     pub enabled: bool,
 }
 
@@ -172,11 +175,12 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     fs::rename(&temp, path).map_err(|err| err.to_string())
 }
 
-pub fn new_rule(process: &str, transparency: u8, blur: u8) -> Rule {
+pub fn new_rule(process: &str, transparency: u8, blur: u8, style: BlurStyle) -> Rule {
     Rule {
         process: mapping::normalize_process(process),
         transparency: mapping::clamp_transparency(transparency),
         blur: mapping::clamp_blur(blur),
+        style,
         enabled: true,
     }
 }
@@ -188,11 +192,12 @@ mod tests {
     #[test]
     fn upsert_matches_names_case_insensitively() {
         let mut store = Store::default();
-        store.upsert(new_rule("Chrome", 30, 40));
-        store.upsert(new_rule("chrome.exe", 50, 60));
+        store.upsert(new_rule("Chrome", 30, 40, BlurStyle::Frost));
+        store.upsert(new_rule("chrome.exe", 50, 60, BlurStyle::Acrylic));
         assert_eq!(store.rules.len(), 1);
         assert_eq!(store.rules[0].transparency, 50);
         assert_eq!(store.rules[0].blur, 60);
+        assert_eq!(store.rules[0].style, BlurStyle::Acrylic);
         assert!(store.remove("CHROME.EXE"));
         assert!(store.rules.is_empty());
     }
@@ -209,6 +214,23 @@ mod tests {
         assert_eq!(store.rules[0].process, "notepad.exe");
         assert_eq!(store.rules[0].transparency, mapping::TRANSPARENCY_MAX);
         assert_eq!(store.rules[0].blur, mapping::BLUR_MIN);
+        assert_eq!(store.rules[0].style, BlurStyle::Frost);
         assert!(!store.paused);
+    }
+
+    #[test]
+    fn acrylic_style_roundtrips_and_old_rules_stay_frost() {
+        let mut store: Store = serde_json::from_str(
+            r#"{"rules":[
+                {"process":"notepad.exe","transparency":30,"blur":40,"style":"acrylic","enabled":true},
+                {"process":"chrome.exe","transparency":30,"blur":40,"enabled":true}
+            ]}"#,
+        )
+        .unwrap();
+        store.normalize();
+        assert_eq!(store.rules[0].style, BlurStyle::Acrylic);
+        assert_eq!(store.rules[1].style, BlurStyle::Frost);
+        let text = serde_json::to_string(&store.rules[0]).unwrap();
+        assert!(text.contains("\"style\":\"acrylic\""));
     }
 }

@@ -8,7 +8,7 @@ Frosted glass behind the Windows apps you pick. Chrome, Edge, Electron apps, Not
 
 ## Features
 
-- Pick any running app, set **transparency** and **blur**, and press **Frost it**. Sliders apply live.
+- Pick any running app, choose **Frost** or **Acrylic**, set **transparency** and **blur**, and press **Frost it**. Sliders apply live. Frost blurs what is behind the window. Acrylic is the milky system glass, and its slider sets how milky it is.
 - Rules are saved per app and come back on every new window of that app. New windows are faded the moment the app creates them, so they never appear solid first.
 - On Windows 11 the Blurman window is frosted glass itself, using the system acrylic backdrop.
 - **Pause** puts every app back without deleting rules. **Restore all** deletes them.
@@ -47,18 +47,19 @@ There is also a small command line:
 
 ```powershell
 blurman list                                        # visible apps Blurman can frost
-blurman apply chrome.exe --transparency 30 --blur 40  # save a rule; opens Blurman if needed
+blurman apply chrome.exe --transparency 30 --blur 40 --style frost    # save a rule; opens Blurman if needed
+blurman apply notepad.exe --transparency 30 --blur 60 --style acrylic # milky glass; blur sets how milky it is
 blurman clear chrome.exe                            # remove one rule
 blurman clear --all                                 # remove every rule and put every app back
 ```
 
-Transparency ranges from 10 to 70 percent, and blur from 1 to 100.
+Transparency ranges from 10 to 70 percent, and blur from 1 to 100. `--style` is `frost` (the default) or `acrylic`.
 
 Rules live in `%APPDATA%\Blurman\rules.json` and settings in `settings.json` next to it. **Start with Windows** adds a `Blurman` entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 ## How it works
 
-Windows cannot blur only the background of another app's window, so Blurman does two things. It fades the whole app with layered-window alpha, and it places a glass window of its own directly behind the app. The glass uses Windows composition to Gaussian-blur whatever is behind it, so what shows through the faded app is frosted instead of sharp. Because the fade applies to the whole window, text fades a little too. Transparency is capped at 70 percent so it stays readable.
+Windows cannot blur only the background of another app's window, so Blurman does two things. It fades the whole app with layered-window alpha, and it places a glass window of its own directly behind the app. The glass uses Windows composition to Gaussian-blur whatever is behind it, so what shows through the faded app is frosted instead of sharp. Acrylic uses Windows' own milky blur instead, and its slider sets how milky that glass is. Because the fade applies to the whole window, text fades a little too. Transparency is capped at 70 percent so it stays readable.
 
 Blurman watches window events, so a new window of a ruled app is faded as soon as the app creates it, usually before it is first drawn. The glass is added a few milliseconds later, when the window appears. Blurman only changes the window's style from outside the app; it never injects code into other processes.
 

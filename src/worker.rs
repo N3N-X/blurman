@@ -2,7 +2,7 @@
 
 use crate::glass::{GlassPane, GlassSession};
 use crate::ipc::{msg_reload, msg_show, msg_shutdown, msg_tweak, HOST_CLASS};
-use crate::mapping::{self, SavedStyle};
+use crate::mapping::{self, BlurStyle, SavedStyle};
 use crate::rules::{self, PersistedWindow, Rule, Store};
 use crate::shared::{Shared, Tweak};
 use crate::target::{self, LiveWindow};
@@ -16,10 +16,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-    RegisterClassExW, SetTimer, TranslateMessage, CHILDID_SELF, EVENT_OBJECT_CLOAKED,
+    GetAncestor, RegisterClassExW, SetTimer, TranslateMessage, CHILDID_SELF, EVENT_OBJECT_CLOAKED,
     EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
     EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, MSG,
-    OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    GA_ROOT, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -31,6 +31,9 @@ const SCAN_TIMER: usize = 1;
 /// Coalesce state.json writes so a burst of new windows is one write.
 const PERSIST_TIMER: usize = 2;
 const PERSIST_MS: u32 = 150;
+/// Focus is reported before Windows finishes the z-order change. Restack again once it has.
+const SETTLE_TIMER: usize = 3;
+const SETTLE_MS: u32 = 100;
 /// How long a window faded at creation may go without becoming a normal app window before it
 /// is put back. Covers hidden helper windows and splash screens.
 const EARLY_WAIT: Duration = Duration::from_secs(3);
@@ -93,16 +96,19 @@ struct Tracked {
     saved: SavedStyle,
     transparency: u8,
     blur: u8,
+    style: BlurStyle,
     pane: GlassPane,
 }
 
 impl Tracked {
-    fn follow(&mut self, hwnd: HWND) {
+    /// Returns whether the glass was restacked. A pane already under the window is left alone.
+    fn follow(&mut self, hwnd: HWND) -> bool {
         if target::is_out_of_view(hwnd) {
             self.pane.hide();
+            false
         } else {
             self.pane
-                .place_under(hwnd, target::frame_bounds(hwnd), target::is_topmost(hwnd));
+                .place_under(hwnd, target::frame_bounds(hwnd), target::is_topmost(hwnd))
         }
     }
 }
@@ -125,6 +131,8 @@ struct Engine {
     persist_armed: bool,
     /// Timer interval last handed to SetTimer. Zero until the host window exists.
     scan_ms: u32,
+    /// A one-shot restack is waiting, so focus that landed early gets another pass.
+    settle_armed: bool,
     /// Rules currently skipped because every window is fullscreen, and the status that says so.
     fullscreen_apps: Vec<String>,
     fullscreen_status: Option<String>,
@@ -158,6 +166,8 @@ pub fn run(shared: Arc<Shared>) {
                 with_engine(Engine::reconcile);
             } else if message.message == WM_TIMER && message.wParam.0 == PERSIST_TIMER {
                 with_engine(Engine::flush_persist);
+            } else if message.message == WM_TIMER && message.wParam.0 == SETTLE_TIMER {
+                with_engine(Engine::settle);
             } else if message.message == reload {
                 with_engine(Engine::reload);
             } else if message.message == show {
@@ -218,6 +228,7 @@ impl Engine {
             pending_state: None,
             persist_armed: false,
             scan_ms: 0,
+            settle_armed: false,
             fullscreen_apps: Vec::new(),
             fullscreen_status: None,
         }
@@ -276,8 +287,8 @@ impl Engine {
             if reused {
                 self.drop_tracked(window.hwnd);
             }
-            if let Some(tracked) = self.tracked.get_mut(&window.hwnd) {
-                sync_tracked(tracked, &window, &rule, &self.shared);
+            if self.tracked.contains_key(&window.hwnd) {
+                self.sync_existing(&window, &rule);
                 continue;
             }
             if self.refused.get(&window.hwnd) == Some(&(window.pid, window.process_start)) {
@@ -369,13 +380,14 @@ impl Engine {
             };
             rule.transparency = mapping::clamp_transparency(tweak.transparency);
             rule.blur = mapping::clamp_blur(tweak.blur);
+            rule.style = tweak.style;
             if !rule.enabled || self.store.paused {
                 None
             } else {
-                Some((rule.transparency, rule.blur, rule.process.clone()))
+                Some((rule.transparency, rule.blur, rule.style, rule.process.clone()))
             }
         };
-        let Some((transparency, blur, process)) = applied else {
+        let Some((transparency, blur, style, process)) = applied else {
             return;
         };
         let keys: Vec<isize> = self
@@ -385,11 +397,26 @@ impl Engine {
             .map(|(hwnd, _)| *hwnd)
             .collect();
         for key in keys {
-            let Some(tracked) = self.tracked.get_mut(&key) else {
-                continue;
-            };
-            apply_values(tracked, target::hwnd_of(key), transparency, blur, &self.shared);
+            self.apply_to(key, transparency, blur, style);
         }
+    }
+
+    fn apply_to(&mut self, key: isize, transparency: u8, blur: u8, style: BlurStyle) {
+        let Engine { glass, tracked, shared, .. } = self;
+        let Some(tracked) = tracked.get_mut(&key) else {
+            return;
+        };
+        apply_values(tracked, target::hwnd_of(key), transparency, blur, style, glass, shared);
+    }
+
+    fn sync_existing(&mut self, window: &LiveWindow, rule: &Rule) {
+        let Engine { glass, tracked, shared, .. } = self;
+        let Some(tracked) = tracked.get_mut(&window.hwnd) else {
+            return;
+        };
+        let hwnd = target::hwnd_of(window.hwnd);
+        apply_values(tracked, hwnd, rule.transparency, rule.blur, rule.style, glass, shared);
+        tracked.follow(hwnd);
     }
 
     fn attach(&mut self, window: LiveWindow, rule: &Rule) -> Result<(), String> {
@@ -401,7 +428,7 @@ impl Engine {
         }
         let hwnd = target::hwnd_of(window.hwnd);
         let saved = self.original_style(window.hwnd, window.pid, window.process_start);
-        let pane = match self.glass.open(window.bounds, rule.blur) {
+        let pane = match self.glass.open(window.bounds, rule.blur, rule.style) {
             Ok(pane) => pane,
             Err(err) => {
                 target::restore_alpha(hwnd, &saved);
@@ -420,6 +447,7 @@ impl Engine {
             saved,
             transparency: rule.transparency,
             blur: rule.blur,
+            style: rule.style,
             pane,
         };
         tracked.follow(hwnd);
@@ -488,7 +516,10 @@ impl Engine {
                     self.update_scan_rate();
                 }
             }
-            EVENT_SYSTEM_FOREGROUND => self.follow_changed(),
+            EVENT_SYSTEM_FOREGROUND => {
+                self.stack_foreground(hwnd);
+                self.arm_settle();
+            },
             // New windows of ruled apps are faded as they are created and frosted the moment
             // they appear, are restored, or get their title, instead of on the next scan.
             EVENT_OBJECT_CREATE
@@ -534,31 +565,54 @@ impl Engine {
         }
     }
 
-    /// Move panes whose z-order or topmost band changed. A pane that is still directly under its
-    /// window is left alone, which skips the DWM bounds query.
+    /// Put the newly focused window's glass behind it with no DWM queries. The settle timer
+    /// fixes size afterward. Querying frames here is what left a sharp frame on screen.
+    fn stack_foreground(&mut self, hwnd: HWND) {
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        let target = if root.0.is_null() { hwnd } else { root };
+        let key = target.0 as isize;
+        if let Some(tracked) = self.tracked.get_mut(&key) {
+            tracked.pane.stack_under(target);
+        }
+    }
+
+    /// Put every glass pane back under its window, using the window's live frame.
+    /// Fullscreen is left to move events and the scan. Checking it here drops the effect during
+    /// the focus animation, and the blur only comes back on the next scan.
     fn follow_changed(&mut self) {
         let keys: Vec<isize> = self.tracked.keys().copied().collect();
-        let mut dropped = false;
         for key in keys {
             let window = target::hwnd_of(key);
-            let topmost = target::is_topmost(window);
-            let needs = self
-                .tracked
-                .get(&key)
-                .is_some_and(|tracked| tracked.pane.needs_place(window, topmost));
-            if !needs {
-                continue;
-            }
-            if target::is_fullscreen(window) {
-                self.drop_tracked(key);
-                dropped = true;
-            } else if let Some(tracked) = self.tracked.get_mut(&key) {
+            if let Some(tracked) = self.tracked.get_mut(&key) {
                 tracked.follow(window);
             }
         }
-        if dropped {
-            self.persist(false);
+    }
+
+    /// Schedule the second restack. SetTimer resets an armed timer, so a burst of focus changes
+    /// settles once, after the last one.
+    fn arm_settle(&mut self) {
+        let hwnd = target::hwnd_of(self.shared.host.load(Ordering::SeqCst));
+        if hwnd.0.is_null() {
+            return;
         }
+        self.settle_armed = true;
+        unsafe {
+            let _ = SetTimer(Some(hwnd), SETTLE_TIMER, SETTLE_MS, None);
+        }
+    }
+
+    fn settle(&mut self) {
+        if self.settle_armed {
+            self.settle_armed = false;
+            let hwnd = target::hwnd_of(self.shared.host.load(Ordering::SeqCst));
+            if !hwnd.0.is_null() {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), SETTLE_TIMER);
+                }
+            }
+        }
+        self.follow_changed();
     }
 
     fn drop_tracked(&mut self, hwnd: isize) {
@@ -672,25 +726,31 @@ impl Engine {
     }
 }
 
-fn sync_tracked(tracked: &mut Tracked, window: &LiveWindow, rule: &Rule, shared: &Shared) {
-    let hwnd = target::hwnd_of(window.hwnd);
-    apply_values(tracked, hwnd, rule.transparency, rule.blur, shared);
-    tracked.follow(hwnd);
-}
-
-fn apply_values(tracked: &mut Tracked, hwnd: HWND, transparency: u8, blur: u8, shared: &Shared) {
+fn apply_values(
+    tracked: &mut Tracked,
+    hwnd: HWND,
+    transparency: u8,
+    blur: u8,
+    style: BlurStyle,
+    glass: &mut GlassSession,
+    shared: &Shared,
+) {
     if tracked.transparency != transparency {
         match target::apply_alpha(hwnd, transparency, false) {
             Ok(()) => tracked.transparency = transparency,
             Err(err) => shared.set_status(format!("{}: {err}", tracked.process)),
         }
     }
-    if tracked.blur != blur {
-        match tracked.pane.set_blur(blur) {
-            Ok(()) => tracked.blur = blur,
+    if tracked.blur != blur || tracked.style != style {
+        match tracked.pane.set_look(glass, style, blur) {
+            Ok(()) => {
+                tracked.blur = blur;
+                tracked.style = style;
+            }
             Err(err) => shared.set_status(format!("{}: {err}", tracked.process)),
         }
     }
+    shared.fallback.store(glass.fallback(), Ordering::SeqCst);
 }
 
 fn install_hooks() -> Vec<HWINEVENTHOOK> {

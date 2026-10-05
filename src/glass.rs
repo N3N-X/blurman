@@ -1,6 +1,6 @@
 //! A glass window that sits behind another app and blurs whatever is behind it.
 
-use crate::mapping;
+use crate::mapping::{self, BlurStyle};
 use windows::core::{implement, Interface, BOOL, GUID, HSTRING, PCWSTR};
 use windows::Foundation::{IPropertyValue, PropertyValue};
 use windows::Graphics::Effects::{
@@ -14,7 +14,8 @@ use windows::UI::Composition::{
 };
 use windows::Win32::Foundation::{E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWINDOWATTRIBUTE,
+    DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_HOSTBACKDROPBRUSH,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
@@ -29,14 +30,16 @@ use windows::Win32::System::WinRT::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindow, GetWindowRect, IsWindowVisible,
     RegisterClassExW, SetWindowPos,
-    ShowWindow, GW_HWNDNEXT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_ERASEBKGND, WM_NCHITTEST, WNDCLASSEXW,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, ShowWindow, GW_HWNDNEXT, HTTRANSPARENT,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOREDRAW, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_ERASEBKGND, WM_NCHITTEST, WNDCLASSEXW,
     WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows_numerics::Vector2;
 
 const CLSID_D2D1_GAUSSIAN_BLUR: GUID = GUID::from_u128(0x1feb6d69_2fe6_4ac9_8c58_1d7f93e7a6a5);
 const WCA_ACCENT_POLICY: i32 = 19;
+const ACCENT_DISABLED: i32 = 0;
 const ACCENT_ENABLE_ACRYLICBLURBEHIND: i32 = 4;
 const GLASS_CLASS: PCWSTR = windows::core::w!("BlurmanGlass");
 
@@ -145,7 +148,7 @@ impl GlassSession {
         self.composition.is_none()
     }
 
-    pub fn open(&mut self, bounds: RECT, blur: u8) -> Result<GlassPane, String> {
+    pub fn open(&mut self, bounds: RECT, blur: u8, style: BlurStyle) -> Result<GlassPane, String> {
         register_class()?;
         let hwnd = create_glass_window(bounds)?;
         let mut pane = GlassPane {
@@ -154,20 +157,9 @@ impl GlassSession {
             topmost: None,
             placed: None,
             corner: None,
+            acrylic: None,
         };
-        if let Some(composition) = &self.composition {
-            match attach_gaussian(composition, hwnd, blur) {
-                Ok(visuals) => {
-                    pane.visuals = Some(visuals);
-                    return Ok(pane);
-                }
-                Err(err) => {
-                    eprintln!("Adjustable blur failed ({err}). Using system acrylic.");
-                    self.composition = None;
-                }
-            }
-        }
-        if let Err(err) = apply_acrylic(hwnd, blur) {
+        if let Err(err) = pane.set_look(self, style, blur) {
             pane.close();
             return Err(err);
         }
@@ -190,60 +182,110 @@ pub struct GlassPane {
     placed: Option<RECT>,
     /// Corner preference already applied, so a still pane is not written again.
     corner: Option<i32>,
+    /// Blur strength while system acrylic is the effect. None while frost is attached.
+    acrylic: Option<u8>,
 }
 
 impl GlassPane {
-    pub fn set_blur(&self, blur: u8) -> Result<(), String> {
-        let Some(visuals) = &self.visuals else {
-            return apply_acrylic(self.hwnd, blur);
-        };
-        let radius = mapping::blur_strength_to_radius(blur);
-        visuals
-            .brush
-            .Properties()
-            .and_then(|props| props.InsertScalar(&HSTRING::from("Blur.BlurAmount"), radius))
-            .map_err(|err| err.to_string())
+    /// Draw `style` at `blur`. Frost uses the adjustable blur when this PC has it, and system
+    /// acrylic otherwise. Acrylic always uses the milky system glass.
+    pub fn set_look(&mut self, session: &mut GlassSession, style: BlurStyle, blur: u8) -> Result<(), String> {
+        let frost_available = self.visuals.is_some() || session.composition.is_some();
+        if style == BlurStyle::Acrylic || !frost_available {
+            self.use_acrylic(blur)
+        } else {
+            self.use_frost(session, blur)
+        }
     }
 
-    /// True when the pane is hidden, in the wrong topmost band, or no longer directly under `target`.
-    /// Uses the last placed bounds, so a still window does not need a DWM frame query.
-    pub fn needs_place(&self, target: HWND, topmost: bool) -> bool {
-        let Some(bounds) = self.placed else {
-            return true;
-        };
-        self.topmost != Some(topmost) || !self.sits_under(target, bounds)
+    fn use_frost(&mut self, session: &mut GlassSession, blur: u8) -> Result<(), String> {
+        if let Some(visuals) = &self.visuals {
+            self.acrylic = None;
+            return set_radius(visuals, blur);
+        }
+        let attached = session.composition.as_ref().map(|composition| {
+            let _ = clear_acrylic(self.hwnd);
+            attach_gaussian(composition, self.hwnd, blur)
+        });
+        match attached {
+            Some(Ok(visuals)) => {
+                self.visuals = Some(visuals);
+                self.acrylic = None;
+                Ok(())
+            }
+            Some(Err(err)) => {
+                eprintln!("Adjustable blur failed ({err}). Using system acrylic.");
+                session.composition = None;
+                self.use_acrylic(blur)
+            }
+            None => self.use_acrylic(blur),
+        }
+    }
+
+    fn use_acrylic(&mut self, blur: u8) -> Result<(), String> {
+        if self.visuals.take().is_some() {
+            let _ = set_dwm_bool(self.hwnd, DWMWA_USE_HOSTBACKDROPBRUSH, false);
+        }
+        apply_acrylic(self.hwnd, blur)?;
+        self.acrylic = Some(blur);
+        Ok(())
     }
 
     /// Size the pane to `bounds` and put it directly beneath `target` in the z-order.
-    pub fn place_under(&mut self, target: HWND, bounds: RECT, topmost: bool) {
-        if self.topmost != Some(topmost) || !self.sits_under(target, bounds) {
-            unsafe {
-                if topmost != self.topmost.unwrap_or(false) {
-                    let band = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        Some(band),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                }
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    Some(target),
-                    bounds.left,
-                    bounds.top,
-                    (bounds.right - bounds.left).max(1),
-                    (bounds.bottom - bounds.top).max(1),
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                );
+    /// Returns whether the pane was actually moved. A window that is already showing is not
+    /// shown again: `SWP_SHOWWINDOW` replays the backdrop fade on every focus switch.
+    pub fn place_under(&mut self, target: HWND, bounds: RECT, topmost: bool) -> bool {
+        let moved = self.topmost != Some(topmost) || !self.sits_under(target, bounds);
+        if moved {
+            let visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
+            let band = (topmost != self.topmost.unwrap_or(false))
+                .then_some(if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST });
+            let mut flags = SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER;
+            if !visible {
+                flags |= SWP_SHOWWINDOW;
             }
+            Self::commit_pos(
+                self.hwnd,
+                target,
+                bounds.left,
+                bounds.top,
+                (bounds.right - bounds.left).max(1),
+                (bounds.bottom - bounds.top).max(1),
+                flags,
+                band,
+            );
             self.topmost = Some(topmost);
+            if let Some(blur) = self.acrylic {
+                let _ = apply_acrylic(self.hwnd, blur);
+            }
         }
         self.placed = Some(bounds);
         self.sync_corner(target);
+        moved
+    }
+
+    /// Move the pane behind `target` without resizing it or asking DWM for the frame.
+    /// Focus handling calls this first so the blur is in place before the slower follow-up.
+    pub fn stack_under(&mut self, target: HWND) {
+        if self.topmost.is_none() {
+            return;
+        }
+        let topmost = crate::target::is_topmost(target);
+        let band = (topmost != self.topmost.unwrap_or(false))
+            .then_some(if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST });
+        if band.is_some() {
+            self.topmost = Some(topmost);
+        }
+        Self::commit_pos(
+            self.hwnd,
+            target,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER,
+            band,
+        );
     }
 
     /// Copy the target's corner preference. Windows 10 has no preference, so a failed read leaves
@@ -270,7 +312,41 @@ impl GlassPane {
         }
     }
 
-    /// Checks the real window rather than a cached position, so outside moves get corrected.
+    /// One z-order update. A band change and the move behind `insert` must land together.
+/// Separate calls paint a frame in between, and that frame is the old window on top.
+fn commit_pos(
+    hwnd: HWND,
+    insert: HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
+    band: Option<HWND>,
+) {
+    let band_flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER | SWP_NOREDRAW;
+    unsafe {
+        let count = if band.is_some() { 2 } else { 1 };
+        let Ok(mut pending) = BeginDeferWindowPos(count) else {
+            if let Some(band) = band {
+                let _ = SetWindowPos(hwnd, Some(band), 0, 0, 0, 0, band_flags);
+            }
+            let _ = SetWindowPos(hwnd, Some(insert), x, y, cx, cy, flags);
+            return;
+        };
+        if let Some(band) = band {
+            match DeferWindowPos(pending, hwnd, Some(band), 0, 0, 0, 0, band_flags) {
+                Ok(next) => pending = next,
+                Err(_) => return,
+            }
+        }
+        if let Ok(pending) = DeferWindowPos(pending, hwnd, Some(insert), x, y, cx, cy, flags) {
+            let _ = EndDeferWindowPos(pending);
+        }
+    }
+}
+
+/// Checks the real window rather than a cached position, so outside moves get corrected.
     fn sits_under(&self, target: HWND, bounds: RECT) -> bool {
         let mut rect = RECT::default();
         unsafe {
@@ -382,6 +458,8 @@ fn create_glass_window(bounds: RECT) -> Result<HWND, String> {
         )
     }
     .map_err(|err| format!("Could not create the glass window: {err}"))?;
+    // Without this, restacking the glass fades the blur in over the next frames.
+    let _ = set_dwm_bool(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, true);
     Ok(hwnd)
 }
 
@@ -439,15 +517,34 @@ fn composition_fn() -> Option<SetCompositionFn> {
     })
 }
 
+fn set_radius(visuals: &Visuals, blur: u8) -> Result<(), String> {
+    let radius = mapping::blur_strength_to_radius(blur);
+    visuals
+        .brush
+        .Properties()
+        .and_then(|props| props.InsertScalar(&HSTRING::from("Blur.BlurAmount"), radius))
+        .map_err(|err| err.to_string())
+}
+
+/// Drop an acrylic policy so a frost brush is not stacked on top of it.
+fn clear_acrylic(hwnd: HWND) -> Result<(), String> {
+    apply_accent(hwnd, ACCENT_DISABLED, 0)
+}
+
 /// Undocumented acrylic blur-behind. It keeps rendering while the window is inactive.
 fn apply_acrylic(hwnd: HWND, blur: u8) -> Result<(), String> {
-    let set = composition_fn().ok_or("SetWindowCompositionAttribute is missing.")?;
     let alpha = mapping::blur_strength_to_tint_alpha(blur) as u32;
     // ABGR: a neutral dark tint. The alpha byte is what the slider moves.
+    apply_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, (alpha << 24) | 0x0018_1818)
+}
+
+fn apply_accent(hwnd: HWND, state: i32, color: u32) -> Result<(), String> {
+    let set = composition_fn().ok_or("SetWindowCompositionAttribute is missing.")?;
     let mut policy = AccentPolicy {
-        state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
-        flags: 2,
-        color: (alpha << 24) | 0x0018_1818,
+        state,
+        // Flag 2 tells acrylic to use the tint. A disabled policy leaves the glass alone.
+        flags: if state == ACCENT_DISABLED { 0 } else { 2 },
+        color,
         animation: 0,
     };
     let data = CompositionAttribute {

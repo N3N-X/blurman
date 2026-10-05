@@ -2,7 +2,7 @@
 
 use crate::autostart;
 use crate::ipc;
-use crate::mapping::{self, BLUR_DEFAULT, TRANSPARENCY_DEFAULT};
+use crate::mapping::{self, BlurStyle, BLUR_DEFAULT, TRANSPARENCY_DEFAULT};
 use crate::rules::{self, Rule, Settings, Store};
 use crate::shared::{Shared, Tweak};
 use crate::target::{self, AppGroup};
@@ -117,6 +117,7 @@ struct BlurmanApp {
     selected: Option<String>,
     transparency: u8,
     blur: u8,
+    style: BlurStyle,
     /// Launched by Windows startup: this session lives in the tray whatever the setting says.
     startup: bool,
     /// The window has a frosted backdrop showing through wherever nothing is drawn.
@@ -143,6 +144,7 @@ impl BlurmanApp {
             selected: None,
             transparency: TRANSPARENCY_DEFAULT,
             blur: BLUR_DEFAULT,
+            style: BlurStyle::Frost,
             startup,
             glass,
             pending_save: None,
@@ -175,7 +177,7 @@ impl BlurmanApp {
 
     fn sliders_from_rule(&mut self) {
         if let Some(rule) = self.selected_rule() {
-            (self.transparency, self.blur) = (rule.transparency, rule.blur);
+            (self.transparency, self.blur, self.style) = (rule.transparency, rule.blur, rule.style);
         }
     }
 
@@ -202,6 +204,7 @@ impl BlurmanApp {
             process: rule.process.clone(),
             transparency: rule.transparency,
             blur: rule.blur,
+            style: rule.style,
         });
         ipc::signal(ipc::msg_tweak());
         self.pending_save = Some(Instant::now() + SAVE_AFTER);
@@ -233,7 +236,7 @@ impl BlurmanApp {
         };
         self.store.paused = false;
         self.store
-            .upsert(rules::new_rule(&process, self.transparency, self.blur));
+            .upsert(rules::new_rule(&process, self.transparency, self.blur, self.style));
         self.publish();
     }
 
@@ -368,6 +371,9 @@ impl BlurmanApp {
                 .num_columns(2)
                 .spacing([16.0, 10.0])
                 .show(ui, |ui| {
+                    ui.label("Look");
+                    moved |= look_picker(ui, &mut self.style);
+                    ui.end_row();
                     ui.label("Transparency");
                     moved |= ui
                         .add(
@@ -379,12 +385,22 @@ impl BlurmanApp {
                         )
                         .changed();
                     ui.end_row();
-                    ui.label("Blur");
+                    let milky = self.style == BlurStyle::Acrylic || self.shared.fallback.load(Ordering::SeqCst);
+                    ui.label(if milky { "Milkiness" } else { "Blur" });
                     moved |= ui
                         .add(Slider::new(&mut self.blur, mapping::BLUR_MIN..=mapping::BLUR_MAX))
                         .changed();
                     ui.end_row();
                 });
+            if !self.shared.fallback.load(Ordering::SeqCst) {
+                ui.label(
+                    theme::muted(match self.style {
+                        BlurStyle::Frost => "Blurs whatever is behind the window.",
+                        BlurStyle::Acrylic => "Milky system glass. The slider sets how milky it is.",
+                    })
+                    .small(),
+                );
+            }
             if ruled && moved {
                 let was_enabled = self.selected_rule().is_some_and(|rule| rule.enabled);
                 if self.store.paused || !was_enabled {
@@ -392,7 +408,7 @@ impl BlurmanApp {
                     self.frost_selected();
                 } else if let Some(process) = self.selected.clone() {
                     self.store
-                        .upsert(rules::new_rule(&process, self.transparency, self.blur));
+                        .upsert(rules::new_rule(&process, self.transparency, self.blur, self.style));
                     self.live_rule(&process);
                 }
             }
@@ -466,9 +482,17 @@ impl BlurmanApp {
                             });
                         });
                         ui.horizontal(|ui| {
+                            ui.label(theme::muted("Look").small());
+                            let look = look_picker(ui, &mut rule.style);
+                            if look && !tweaked.iter().any(|item: &String| item == &rule.process) {
+                                tweaked.push(rule.process.clone());
+                            }
+                        });
+                        ui.horizontal(|ui| {
                             // Room left after both labels and both value boxes.
+                            let milky = rule.style == BlurStyle::Acrylic;
                             ui.spacing_mut().slider_width =
-                                ((ui.available_width() - 290.0) / 2.0).clamp(60.0, 180.0);
+                                ((ui.available_width() - if milky { 330.0 } else { 290.0 }) / 2.0).clamp(60.0, 180.0);
                             ui.label(theme::muted("Transparency").small());
                             let transparency = ui.add(
                                 Slider::new(
@@ -478,7 +502,7 @@ impl BlurmanApp {
                                 .suffix("%"),
                             );
                             ui.add_space(6.0);
-                            ui.label(theme::muted("Blur").small());
+                            ui.label(theme::muted(if milky { "Milky" } else { "Blur" }).small());
                             let blur = ui.add(Slider::new(&mut rule.blur, mapping::BLUR_MIN..=mapping::BLUR_MAX));
                             if (transparency.changed() || blur.changed())
                                 && !tweaked.iter().any(|item: &String| item == &rule.process)
@@ -630,6 +654,27 @@ impl eframe::App for BlurmanApp {
     }
 }
 
+fn look_picker(ui: &mut Ui, style: &mut BlurStyle) -> bool {
+    let mut changed = false;
+    Frame::new()
+        .fill(ROW)
+        .stroke(theme::line(1.0, CARD_STROKE))
+        .corner_radius(8)
+        .inner_margin(Margin::same(2))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            changed |= ui
+                .selectable_value(style, BlurStyle::Frost, "Frost")
+                .on_hover_text("Blur whatever is behind the window. The slider sets how far it spreads.")
+                .changed();
+            changed |= ui
+                .selectable_value(style, BlurStyle::Acrylic, "Acrylic")
+                .on_hover_text("Milky system glass. The slider sets how milky it is.")
+                .changed();
+        });
+    changed
+}
+
 fn banner(ui: &mut Ui, color: Color32, add_contents: impl FnOnce(&mut Ui)) {
     Frame::new()
         .fill(color.gamma_multiply(0.10))
@@ -666,7 +711,11 @@ fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -
                     );
                     ui.label(theme::muted(count).small());
                     if let Some(rule) = rule {
-                        theme::badge(ui, &format!("Frosted · {}%", rule.transparency), ACCENT);
+                        let look = match rule.style {
+                            BlurStyle::Frost => "Frost",
+                            BlurStyle::Acrylic => "Acrylic",
+                        };
+                        theme::badge(ui, &format!("{look} · {}%", rule.transparency), ACCENT);
                     }
                     if group.fullscreen {
                         theme::badge(ui, "Fullscreen", WARN);

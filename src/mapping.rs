@@ -10,6 +10,25 @@ pub const BLUR_MIN: u8 = 1;
 pub const BLUR_MAX: u8 = 100;
 pub const BLUR_DEFAULT: u8 = 40;
 
+/// How the glass is drawn. Frost is the adjustable blur. Acrylic is Windows' milky system glass,
+/// where the same slider sets how milky it is. Missing values in old rules files stay Frost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum BlurStyle {
+    #[default]
+    Frost,
+    Acrylic,
+}
+
+impl std::fmt::Display for BlurStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BlurStyle::Frost => "frost",
+            BlurStyle::Acrylic => "acrylic",
+        })
+    }
+}
+
 const BLUR_RADIUS_MIN: f32 = 4.0;
 const BLUR_RADIUS_MAX: f32 = 48.0;
 

@@ -23,7 +23,10 @@ use windows::Win32::UI::HiDpi::{
 };
 
 #[derive(Parser)]
-#[command(name = "blurman", about = "Frosted glass for the apps you pick. Run with no command to open the window.")]
+#[command(
+    name = "blurman",
+    about = "Frosted glass for the apps you pick. Run with no command to open the window."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -89,7 +92,11 @@ fn run_command(command: Command) -> Result<(), String> {
                     group.process,
                     group.windows,
                     if group.windows == 1 { " " } else { "s" },
-                    if group.elevated { "  administrator" } else { "" }
+                    if group.elevated {
+                        "  administrator"
+                    } else {
+                        ""
+                    }
                 );
                 if !group.sample_title.is_empty() {
                     println!("  {}", group.sample_title);

@@ -6,17 +6,21 @@ use crate::mapping::{self, BlurStyle, BLUR_DEFAULT, TRANSPARENCY_DEFAULT};
 use crate::rules::{self, Rule, Settings, Store};
 use crate::shared::{Shared, Tweak};
 use crate::target::{self, AppGroup};
-use crate::theme::{self, ACCENT, CARD_STROKE, MUTED, ROW, ROW_HOVER, ROW_SELECTED, TEXT, WARN};
+use crate::theme::{self, ACCENT, MUTED, OK, ROW_HOVER, ROW_SELECTED, TEXT, WARN};
 use crate::tray;
-use egui::{Align, Color32, CursorIcon, Frame, Layout, Margin, RichText, Sense, Shape, Slider, Ui};
+use egui::{
+    Align, Color32, CursorIcon, Frame, Layout, Margin, RichText, Sense, Shape, Slider, Stroke, Ui,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Controls::MARGINS;
@@ -51,8 +55,8 @@ fn open_window(shared: &Arc<Shared>, tray_session: bool) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Blurman")
-            .with_inner_size([560.0, 800.0])
-            .with_min_inner_size([480.0, 600.0])
+            .with_inner_size([1000.0, 680.0])
+            .with_min_inner_size([900.0, 560.0])
             .with_transparent(true)
             .with_icon(window_icon()),
         ..Default::default()
@@ -67,7 +71,9 @@ fn open_window(shared: &Arc<Shared>, tray_session: bool) -> Result<(), String> {
             let mut glass = false;
             if let Ok(handle) = cc.window_handle() {
                 if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                    app_shared.main_window.store(win32.hwnd.get(), Ordering::SeqCst);
+                    app_shared
+                        .main_window
+                        .store(win32.hwnd.get(), Ordering::SeqCst);
                     glass = frost_window(HWND(win32.hwnd.get() as *mut _));
                 }
             }
@@ -89,19 +95,36 @@ fn open_window(shared: &Arc<Shared>, tray_session: bool) -> Result<(), String> {
 /// Give the window the Windows 11 acrylic backdrop, so Blurman itself is frosted glass.
 /// False on Windows versions without system backdrops, where the window stays opaque.
 fn frost_window(hwnd: HWND) -> bool {
-    let set = |attribute: DWMWINDOWATTRIBUTE, value: i32| unsafe {
-        DwmSetWindowAttribute(hwnd, attribute, (&raw const value).cast(), size_of::<i32>() as u32)
+    let set_i32 = |attribute: DWMWINDOWATTRIBUTE, value: i32| unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            attribute,
+            (&raw const value).cast(),
+            size_of::<i32>() as u32,
+        )
     };
-    let _ = set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
-    let margins = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+    let set_color = |attribute: DWMWINDOWATTRIBUTE, value: u32| unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            attribute,
+            (&raw const value).cast(),
+            size_of::<u32>() as u32,
+        )
+    };
+    let _ = set_i32(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
+    // Same caption treatment as the pump screen window: round corners, plum border, light text.
+    let _ = set_i32(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND.0);
+    let _ = set_color(DWMWA_BORDER_COLOR, 0x0030_2832);
+    let _ = set_color(DWMWA_CAPTION_COLOR, 0x0018_1016);
+    let _ = set_color(DWMWA_TEXT_COLOR, 0x00F2_EEF0);
+    let margins = MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
     unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }.is_ok()
-        && set(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW.0).is_ok()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    Apps,
-    Settings,
+        && set_i32(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW.0).is_ok()
 }
 
 struct BlurmanApp {
@@ -110,7 +133,6 @@ struct BlurmanApp {
     settings: Settings,
     autostart: bool,
     tray_error: Option<String>,
-    tab: Tab,
     seen_generation: u64,
     groups: Vec<AppGroup>,
     scanned: Instant,
@@ -122,13 +144,20 @@ struct BlurmanApp {
     startup: bool,
     /// The window has a frosted backdrop showing through wherever nothing is drawn.
     glass: bool,
-    logo: egui::TextureHandle,
+    /// A window saved from the old narrow layout is widened once.
+    window_fitted: bool,
     /// When a slider edit should be written. None while the file matches the sliders.
     pending_save: Option<Instant>,
 }
 
 impl BlurmanApp {
-    fn new(shared: Arc<Shared>, settings: Settings, startup: bool, glass: bool, ctx: &egui::Context) -> Self {
+    fn new(
+        shared: Arc<Shared>,
+        settings: Settings,
+        startup: bool,
+        glass: bool,
+        _ctx: &egui::Context,
+    ) -> Self {
         let store = rules::load();
         let tray_error = tray::sync(settings.close_to_tray || startup, store.paused).err();
         Self {
@@ -137,7 +166,6 @@ impl BlurmanApp {
             settings,
             autostart: autostart::is_enabled(),
             tray_error,
-            tab: Tab::Apps,
             seen_generation: 0,
             groups: target::list_groups(),
             scanned: Instant::now(),
@@ -147,8 +175,8 @@ impl BlurmanApp {
             style: BlurStyle::Frost,
             startup,
             glass,
+            window_fitted: false,
             pending_save: None,
-            logo: load_logo(ctx),
         }
     }
 
@@ -182,14 +210,17 @@ impl BlurmanApp {
     }
 
     fn selected_rule(&self) -> Option<&Rule> {
-        self.selected.as_deref().and_then(|process| self.store.rule(process))
+        self.selected
+            .as_deref()
+            .and_then(|process| self.store.rule(process))
     }
 
     fn publish(&mut self) {
         self.pending_save = None;
         self.store.normalize();
         if let Err(err) = rules::save(&self.store) {
-            self.shared.set_status(format!("Could not save rules: {err}"));
+            self.shared
+                .set_status(format!("Could not save rules: {err}"));
             return;
         }
         ipc::signal(ipc::msg_reload());
@@ -214,7 +245,8 @@ impl BlurmanApp {
         self.pending_save = None;
         self.store.normalize();
         if let Err(err) = rules::save(&self.store) {
-            self.shared.set_status(format!("Could not save rules: {err}"));
+            self.shared
+                .set_status(format!("Could not save rules: {err}"));
         }
     }
 
@@ -224,7 +256,9 @@ impl BlurmanApp {
             return RESCAN;
         };
         if pointer_down && deadline > Instant::now() {
-            return deadline.saturating_duration_since(Instant::now()).min(RESCAN);
+            return deadline
+                .saturating_duration_since(Instant::now())
+                .min(RESCAN);
         }
         self.flush_rules_file();
         RESCAN
@@ -235,8 +269,12 @@ impl BlurmanApp {
             return;
         };
         self.store.paused = false;
-        self.store
-            .upsert(rules::new_rule(&process, self.transparency, self.blur, self.style));
+        self.store.upsert(rules::new_rule(
+            &process,
+            self.transparency,
+            self.blur,
+            self.style,
+        ));
         self.publish();
     }
 
@@ -252,29 +290,41 @@ impl BlurmanApp {
         self.publish();
     }
 
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        if self.window_fitted {
+            return;
+        }
+        self.window_fitted = true;
+        let narrow = ctx.input(|input| {
+            input
+                .viewport()
+                .inner_rect
+                .map(|rect| rect.width() < 900.0)
+                .unwrap_or(true)
+        });
+        if narrow {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1000.0, 680.0)));
+        }
+    }
+
     fn header(&mut self, ui: &mut Ui) {
-        let roomy = ui.available_width() >= 500.0;
         ui.horizontal(|ui| {
-            ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(34.0, 34.0)));
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.heading(RichText::new("Blurman").strong().color(TEXT));
-                if roomy {
-                    ui.label(theme::muted("Frosted glass behind the apps you pick").small());
-                }
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                Frame::new()
-                    .fill(theme::CARD)
-                    .stroke(theme::line(1.0, CARD_STROKE))
-                    .corner_radius(10)
-                    .inner_margin(Margin::same(3))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.selectable_value(&mut self.tab, Tab::Settings, " Settings ");
-                        ui.selectable_value(&mut self.tab, Tab::Apps, " Apps ");
-                    });
-            });
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 22.0), Sense::hover());
+            let mark = if self.store.paused { WARN } else { ACCENT };
+            ui.painter().circle_filled(rect.center(), 5.0, mark);
+            ui.heading(RichText::new("Blurman").color(TEXT));
+            ui.label(theme::muted("Frosted glass behind the apps you pick"));
+            let frosted = self.store.rules.iter().filter(|rule| rule.enabled).count();
+            let (text, color) = if self.store.paused {
+                ("Paused".to_string(), WARN)
+            } else if frosted == 0 {
+                ("Ready".to_string(), MUTED)
+            } else if frosted == 1 {
+                ("1 frosted".to_string(), OK)
+            } else {
+                (format!("{frosted} frosted"), OK)
+            };
+            theme::status_pill(ui, &text, color);
         });
     }
 
@@ -283,7 +333,10 @@ impl BlurmanApp {
             banner(ui, WARN, |ui| {
                 ui.label(RichText::new("Paused. Every app is back to normal.").color(WARN));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(theme::primary_button("Resume").min_size(egui::vec2(80.0, 26.0))).clicked() {
+                    if ui
+                        .add(theme::primary_button("Resume").min_size(egui::vec2(80.0, 26.0)))
+                        .clicked()
+                    {
                         self.set_paused(false);
                     }
                 });
@@ -307,21 +360,13 @@ impl BlurmanApp {
         }
     }
 
-    fn apps_tab(&mut self, ui: &mut Ui) {
-        self.running_apps(ui);
-        ui.add_space(4.0);
-        self.glass_controls(ui);
-        ui.add_space(4.0);
-        self.saved_rules(ui);
-    }
-
     fn running_apps(&mut self, ui: &mut Ui) {
         let mut picked = None;
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(theme::card_title("Running apps"));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(theme::quiet_button("Refresh").small()).clicked() {
+                    if ui.button("Refresh").clicked() {
                         self.rescan();
                     }
                 });
@@ -362,41 +407,40 @@ impl BlurmanApp {
                 }
             });
             if self.selected.is_none() {
-                ui.label(theme::muted("Pick an app above, set the look, then frost it."));
+                ui.label(theme::muted(
+                    "Pick an app on the left, set the look, then frost it.",
+                ));
             }
             ui.add_space(4.0);
-            ui.spacing_mut().slider_width = (ui.available_width() - 190.0).clamp(100.0, 320.0);
             let mut moved = false;
-            egui::Grid::new("glass")
-                .num_columns(2)
-                .spacing([16.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label("Look");
-                    moved |= look_picker(ui, &mut self.style);
-                    ui.end_row();
-                    ui.label("Transparency");
-                    moved |= ui
-                        .add(
-                            Slider::new(
-                                &mut self.transparency,
-                                mapping::TRANSPARENCY_MIN..=mapping::TRANSPARENCY_MAX,
-                            )
-                            .suffix("%"),
-                        )
-                        .changed();
-                    ui.end_row();
-                    let milky = self.style == BlurStyle::Acrylic || self.shared.fallback.load(Ordering::SeqCst);
-                    ui.label(if milky { "Milkiness" } else { "Blur" });
-                    moved |= ui
-                        .add(Slider::new(&mut self.blur, mapping::BLUR_MIN..=mapping::BLUR_MAX))
-                        .changed();
-                    ui.end_row();
-                });
+            ui.horizontal(|ui| {
+                ui.label(theme::muted("Look"));
+                moved |= look_picker(ui, &mut self.style);
+            });
+            let milky =
+                self.style == BlurStyle::Acrylic || self.shared.fallback.load(Ordering::SeqCst);
+            moved |= labeled_slider(ui, "Transparency", |ui| {
+                ui.add(
+                    Slider::new(
+                        &mut self.transparency,
+                        mapping::TRANSPARENCY_MIN..=mapping::TRANSPARENCY_MAX,
+                    )
+                    .suffix("%"),
+                )
+            });
+            moved |= labeled_slider(ui, if milky { "Milkiness" } else { "Blur" }, |ui| {
+                ui.add(Slider::new(
+                    &mut self.blur,
+                    mapping::BLUR_MIN..=mapping::BLUR_MAX,
+                ))
+            });
             if !self.shared.fallback.load(Ordering::SeqCst) {
                 ui.label(
                     theme::muted(match self.style {
                         BlurStyle::Frost => "Blurs whatever is behind the window.",
-                        BlurStyle::Acrylic => "Milky system glass. The slider sets how milky it is.",
+                        BlurStyle::Acrylic => {
+                            "Milky system glass. The slider sets how milky it is."
+                        }
                     })
                     .small(),
                 );
@@ -407,23 +451,27 @@ impl BlurmanApp {
                     // Enabling, or waking from pause, has to attach panes. A pure slider edit does not.
                     self.frost_selected();
                 } else if let Some(process) = self.selected.clone() {
-                    self.store
-                        .upsert(rules::new_rule(&process, self.transparency, self.blur, self.style));
+                    self.store.upsert(rules::new_rule(
+                        &process,
+                        self.transparency,
+                        self.blur,
+                        self.style,
+                    ));
                     self.live_rule(&process);
                 }
             }
             ui.add_space(6.0);
             ui.add_enabled_ui(self.selected.is_some(), |ui| {
-                if ruled {
-                    ui.horizontal(|ui| {
-                        if ui.add(theme::danger_button("Remove frost").min_size(egui::vec2(120.0, 30.0))).clicked() {
+                ui.horizontal(|ui| {
+                    if ruled {
+                        if ui.button("Remove frost").clicked() {
                             self.unfrost_selected();
                         }
-                        ui.label(theme::muted("Changes apply as you drag.").small());
-                    });
-                } else if ui.add(theme::primary_button("Frost it")).clicked() {
-                    self.frost_selected();
-                }
+                        ui.label(theme::muted("Changes apply as you drag."));
+                    } else if ui.add(theme::primary_button("Frost it")).clicked() {
+                        self.frost_selected();
+                    }
+                });
             });
         });
     }
@@ -440,7 +488,7 @@ impl BlurmanApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let any = !self.store.rules.is_empty();
                     if ui
-                        .add_enabled(any, theme::danger_button("Restore all").small())
+                        .add_enabled(any, egui::Button::new("Restore all"))
                         .on_hover_text("Delete every rule and put every app back.")
                         .clicked()
                     {
@@ -448,7 +496,7 @@ impl BlurmanApp {
                     }
                     let label = if self.store.paused { "Resume" } else { "Pause" };
                     if ui
-                        .add_enabled(any, theme::quiet_button(label).small())
+                        .add_enabled(any, egui::Button::new(label))
                         .on_hover_text("Put every app back without deleting rules.")
                         .clicked()
                     {
@@ -463,26 +511,32 @@ impl BlurmanApp {
             ui.add_space(2.0);
             for rule in &mut self.store.rules {
                 Frame::new()
-                    .fill(ROW)
-                    .stroke(theme::line(1.0, CARD_STROKE))
-                    .corner_radius(10)
+                    .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 10))
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+                    ))
+                    .corner_radius(12)
                     .inner_margin(Margin::symmetric(12, 10))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            structural |= theme::toggle(ui, &mut rule.enabled)
+                            let color = if rule.enabled { TEXT } else { MUTED };
+                            structural |= ui
+                                .checkbox(
+                                    &mut rule.enabled,
+                                    RichText::new(&rule.process).strong().color(color),
+                                )
                                 .on_hover_text("Turn this rule on or off.")
                                 .changed();
-                            let color = if rule.enabled { TEXT } else { MUTED };
-                            ui.label(RichText::new(&rule.process).strong().color(color));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.add(theme::danger_button("Remove").small()).clicked() {
+                                if ui.button("Remove").clicked() {
                                     delete = Some(rule.process.clone());
                                 }
                             });
                         });
                         ui.horizontal(|ui| {
-                            ui.label(theme::muted("Look").small());
+                            ui.label(theme::muted("Look"));
                             let look = look_picker(ui, &mut rule.style);
                             if look && !tweaked.iter().any(|item: &String| item == &rule.process) {
                                 tweaked.push(rule.process.clone());
@@ -492,7 +546,8 @@ impl BlurmanApp {
                             // Room left after both labels and both value boxes.
                             let milky = rule.style == BlurStyle::Acrylic;
                             ui.spacing_mut().slider_width =
-                                ((ui.available_width() - if milky { 330.0 } else { 290.0 }) / 2.0).clamp(60.0, 180.0);
+                                ((ui.available_width() - if milky { 330.0 } else { 290.0 }) / 2.0)
+                                    .clamp(60.0, 180.0);
                             ui.label(theme::muted("Transparency").small());
                             let transparency = ui.add(
                                 Slider::new(
@@ -503,7 +558,10 @@ impl BlurmanApp {
                             );
                             ui.add_space(6.0);
                             ui.label(theme::muted(if milky { "Milky" } else { "Blur" }).small());
-                            let blur = ui.add(Slider::new(&mut rule.blur, mapping::BLUR_MIN..=mapping::BLUR_MAX));
+                            let blur = ui.add(Slider::new(
+                                &mut rule.blur,
+                                mapping::BLUR_MIN..=mapping::BLUR_MAX,
+                            ));
                             if (transparency.changed() || blur.changed())
                                 && !tweaked.iter().any(|item: &String| item == &rule.process)
                             {
@@ -536,59 +594,63 @@ impl BlurmanApp {
         }
     }
 
-    fn settings_tab(&mut self, ui: &mut Ui) {
+    fn startup_card(&mut self, ui: &mut Ui) {
         theme::card(ui, |ui| {
-            ui.label(theme::card_title("Startup and closing"));
+            ui.label(theme::card_title("Startup and tray"));
             ui.add_space(4.0);
             let mut autostart = self.autostart;
-            if setting_row(
-                ui,
-                "Start with Windows",
-                "Open Blurman when you sign in, so your apps are frosted right away. \
-                 It starts quietly in the tray; click the tray icon to open this window.",
-                &mut autostart,
-            ) {
+            if ui
+                .checkbox(&mut autostart, "Start when I sign in to Windows")
+                .changed()
+            {
                 match autostart::set_enabled(autostart) {
                     Ok(()) => self.autostart = autostart,
                     Err(err) => self.shared.set_status(err),
                 }
             }
-            ui.separator();
-            if setting_row(
-                ui,
-                "Keep in tray on close",
-                "Closing the window hides Blurman in the tray and keeps your apps frosted. \
-                 Choose Exit from the tray menu to put them back.",
-                &mut self.settings.close_to_tray,
-            ) {
+            if ui
+                .checkbox(
+                    &mut self.settings.close_to_tray,
+                    "Keep running in the tray when the window closes",
+                )
+                .changed()
+            {
                 if let Err(err) = rules::save_settings(&self.settings) {
-                    self.shared.set_status(format!("Could not save settings: {err}"));
+                    self.shared
+                        .set_status(format!("Could not save settings: {err}"));
                 }
                 self.tray_error = tray::sync(self.wants_tray(), self.store.paused).err();
             }
             if let Some(err) = &self.tray_error {
                 ui.colored_label(WARN, err);
             }
+            ui.label(theme::muted(
+                "Click the tray icon to show this window. Right-click it to pause or exit.",
+            ));
         });
-        ui.add_space(4.0);
+    }
+
+    fn files_card(&mut self, ui: &mut Ui) {
         theme::card(ui, |ui| {
             ui.label(theme::card_title("Files"));
             ui.label(theme::muted("Rules and settings are saved in"));
             let dir = rules::app_dir();
-            ui.label(RichText::new(dir.display().to_string()).monospace().color(TEXT));
-            if ui.add(theme::quiet_button("Open folder")).clicked() {
+            ui.label(
+                RichText::new(dir.display().to_string())
+                    .monospace()
+                    .color(TEXT),
+            );
+            if ui.button("Open folder").clicked() {
                 let _ = std::fs::create_dir_all(&dir);
                 let _ = std::process::Command::new("explorer").arg(&dir).spawn();
             }
-        });
-        ui.add_space(4.0);
-        theme::card(ui, |ui| {
-            ui.label(theme::card_title("About"));
-            ui.label(theme::muted(format!(
-                "Blurman {}. The app is faded and a blurred glass window sits right behind it, \
-                 so whatever shows through is frosted rather than sharp.",
-                env!("CARGO_PKG_VERSION")
-            )));
+            ui.label(
+                theme::muted(format!(
+                    "Blurman {}. The app is faded, and a blurred glass window sits right behind it.",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .small(),
+            );
         });
     }
 }
@@ -596,8 +658,7 @@ impl BlurmanApp {
 impl eframe::App for BlurmanApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         if self.glass {
-            // A light dark tint over the acrylic keeps text readable on bright wallpapers.
-            [0.0, 0.0, 0.0, 0.28]
+            [0.0, 0.0, 0.0, 0.0]
         } else {
             theme::BG.to_normalized_gamma_f32()
         }
@@ -621,32 +682,35 @@ impl eframe::App for BlurmanApp {
             self.tray_error = tray::sync(true, self.store.paused).err();
         }
 
-        let panel = |margin: Margin| Frame::new().inner_margin(margin);
-        egui::TopBottomPanel::top("header")
-            .frame(panel(Margin { left: 18, right: 18, top: 14, bottom: 10 }))
-            .show_separator_line(false)
-            .show(ctx, |ui| self.header(ui));
+        self.fit_window(ctx);
         let footer = if self.keeps_in_tray() {
             "Closing hides Blurman in the tray. Exit from the tray puts every app back."
         } else {
             "Closing Blurman puts every app back to normal."
         };
-        egui::TopBottomPanel::bottom("footer")
-            .frame(panel(Margin::symmetric(18, 8)))
-            .show_separator_line(false)
-            .show(ctx, |ui| ui.label(theme::muted(footer).small()));
         egui::CentralPanel::default()
-            .frame(panel(Margin::symmetric(18, 4)))
+            .frame(theme::shell(self.glass))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.banners(ui);
-                        match self.tab {
-                            Tab::Apps => self.apps_tab(ui),
-                            Tab::Settings => self.settings_tab(ui),
-                        }
+                        self.header(ui);
                         ui.add_space(8.0);
+                        self.banners(ui);
+                        ui.columns_const(|[ref mut left, ref mut right]| {
+                            self.running_apps(left);
+                            right.vertical(|ui| {
+                                self.glass_controls(ui);
+                                ui.add_space(8.0);
+                                self.startup_card(ui);
+                                ui.add_space(8.0);
+                                self.files_card(ui);
+                            });
+                        });
+                        ui.add_space(8.0);
+                        self.saved_rules(ui);
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(footer).size(13.5).color(MUTED));
                     });
             });
         let pointer_down = ctx.input(|input| input.pointer.any_down());
@@ -656,36 +720,46 @@ impl eframe::App for BlurmanApp {
 
 fn look_picker(ui: &mut Ui, style: &mut BlurStyle) -> bool {
     let mut changed = false;
-    Frame::new()
-        .fill(ROW)
-        .stroke(theme::line(1.0, CARD_STROKE))
-        .corner_radius(8)
-        .inner_margin(Margin::same(2))
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            changed |= ui
-                .selectable_value(style, BlurStyle::Frost, "Frost")
-                .on_hover_text("Blur whatever is behind the window. The slider sets how far it spreads.")
-                .changed();
-            changed |= ui
-                .selectable_value(style, BlurStyle::Acrylic, "Acrylic")
-                .on_hover_text("Milky system glass. The slider sets how milky it is.")
-                .changed();
-        });
+    if theme::choice(ui, *style == BlurStyle::Frost, "Frost")
+        .on_hover_text("Blur whatever is behind the window. The slider sets how far it spreads.")
+        .clicked()
+        && *style != BlurStyle::Frost
+    {
+        *style = BlurStyle::Frost;
+        changed = true;
+    }
+    if theme::choice(ui, *style == BlurStyle::Acrylic, "Acrylic")
+        .on_hover_text("Milky system glass. The slider sets how milky it is.")
+        .clicked()
+        && *style != BlurStyle::Acrylic
+    {
+        *style = BlurStyle::Acrylic;
+        changed = true;
+    }
+    changed
+}
+
+fn labeled_slider(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> egui::Response) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(theme::muted(label));
+        ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(80.0);
+        changed = add(ui).changed();
+    });
     changed
 }
 
 fn banner(ui: &mut Ui, color: Color32, add_contents: impl FnOnce(&mut Ui)) {
     Frame::new()
-        .fill(color.gamma_multiply(0.10))
-        .stroke(theme::line(1.0, color.gamma_multiply(0.35)))
+        .fill(color.gamma_multiply(0.22))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
         .corner_radius(10)
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(add_contents);
         });
-    ui.add_space(4.0);
+    ui.add_space(8.0);
 }
 
 fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -> egui::Response {
@@ -715,13 +789,13 @@ fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -
                             BlurStyle::Frost => "Frost",
                             BlurStyle::Acrylic => "Acrylic",
                         };
-                        theme::badge(ui, &format!("{look} · {}%", rule.transparency), ACCENT);
+                        theme::status_pill(ui, &format!("{look} · {}%", rule.transparency), ACCENT);
                     }
                     if group.fullscreen {
-                        theme::badge(ui, "Fullscreen", WARN);
+                        theme::status_pill(ui, "Fullscreen", WARN);
                     }
                     if group.elevated {
-                        theme::badge(ui, "Admin", WARN);
+                        theme::status_pill(ui, "Admin", WARN);
                     }
                 });
             });
@@ -731,7 +805,8 @@ fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -
         .interact(rect, ui.id().with(("app", &group.process)), Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand);
     if group.fullscreen {
-        response = response.on_hover_text("This app covers the screen, so Blurman leaves it alone.");
+        response =
+            response.on_hover_text("This app covers the screen, so Blurman leaves it alone.");
     }
     let fill = if selected {
         ROW_SELECTED
@@ -740,25 +815,9 @@ fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().set(background, Shape::rect_filled(rect, 8, fill));
+    ui.painter()
+        .set(background, Shape::rect_filled(rect, 8, fill));
     response
-}
-
-/// A title, a description, and a switch on the right. Returns true when the switch was flipped.
-fn setting_row(ui: &mut Ui, title: &str, description: &str, on: &mut bool) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        let text_width = (ui.available_width() - 60.0).max(160.0);
-        ui.vertical(|ui| {
-            ui.set_width(text_width);
-            ui.label(RichText::new(title).strong().color(TEXT));
-            ui.add(egui::Label::new(theme::muted(description).small()).wrap());
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            changed = theme::toggle(ui, on).changed();
-        });
-    });
-    changed
 }
 
 fn decode_icon(bytes: &[u8]) -> egui::IconData {
@@ -777,13 +836,4 @@ pub fn window_icon() -> egui::IconData {
 
 pub fn tray_icon() -> egui::IconData {
     decode_icon(include_bytes!("../assets/icon-32.png"))
-}
-
-fn load_logo(ctx: &egui::Context) -> egui::TextureHandle {
-    let icon = decode_icon(include_bytes!("../assets/icon-64.png"));
-    let image = egui::ColorImage::from_rgba_unmultiplied(
-        [icon.width as usize, icon.height as usize],
-        &icon.rgba,
-    );
-    ctx.load_texture("blurman-logo", image, egui::TextureOptions::LINEAR)
 }

@@ -68,7 +68,10 @@ impl Shared {
     }
 
     pub fn take_tweaks(&self) -> Vec<Tweak> {
-        self.tweaks.lock().map(|mut tweaks| std::mem::take(&mut *tweaks)).unwrap_or_default()
+        self.tweaks
+            .lock()
+            .map(|mut tweaks| std::mem::take(&mut *tweaks))
+            .unwrap_or_default()
     }
 
     pub fn set_ctx(&self, ctx: Option<egui::Context>) {
@@ -85,7 +88,10 @@ impl Shared {
     }
 
     pub fn status(&self) -> String {
-        self.status.lock().map(|text| text.clone()).unwrap_or_default()
+        self.status
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default()
     }
 
     pub fn repaint(&self) {
@@ -111,7 +117,11 @@ impl Shared {
             return;
         }
         unsafe {
-            let command = if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW };
+            let command = if IsIconic(hwnd).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            };
             let _ = ShowWindowAsync(hwnd, command);
             let _ = SetForegroundWindow(hwnd);
         }

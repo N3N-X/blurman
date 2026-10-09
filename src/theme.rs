@@ -1,100 +1,94 @@
-//! Colors, spacing, and the small custom widgets the window is built from.
+//! Colors, spacing, and the small widgets the window is built from.
+//!
+//! The palette matches the pump screen app: a dark plum shell, rose accent, and
+//! rounded cards over the window's frosted backdrop.
 
-use egui::{
-    Color32, CornerRadius, FontId, Frame, Margin, Response, RichText, Sense, Stroke, StrokeKind,
-    TextStyle, Ui, Vec2,
-};
+use egui::{Color32, CornerRadius, Frame, Margin, RichText, Shadow, Stroke, Ui, Vec2};
 
-// Surfaces are translucent white or accent laid over the window's frosted backdrop. Colors
-// are premultiplied, so the channels of a translucent color never exceed its alpha.
-pub const ACCENT: Color32 = Color32::from_rgb(125, 196, 255);
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(58, 104, 150);
+pub const ACCENT: Color32 = Color32::from_rgb(196, 54, 78);
 /// Behind everything when Windows cannot frost the window.
-pub const BG: Color32 = Color32::from_rgb(16, 18, 23);
+pub const BG: Color32 = Color32::from_rgb(16, 14, 20);
 /// Tooltips and menus, which float over content and need to stay readable.
-pub const POPUP: Color32 = Color32::from_rgb(30, 33, 41);
-pub const CARD: Color32 = white(14);
-pub const CARD_STROKE: Color32 = white(24);
-pub const ROW: Color32 = white(10);
-pub const ROW_HOVER: Color32 = white(20);
-pub const ROW_SELECTED: Color32 = Color32::from_rgba_premultiplied(29, 46, 60, 60);
-pub const TEXT: Color32 = Color32::from_rgb(236, 240, 247);
-pub const MUTED: Color32 = Color32::from_rgb(160, 168, 184);
-pub const WARN: Color32 = Color32::from_rgb(240, 190, 110);
-pub const DANGER: Color32 = Color32::from_rgb(235, 120, 120);
-
-const fn white(alpha: u8) -> Color32 {
-    Color32::from_rgba_premultiplied(alpha, alpha, alpha, alpha)
-}
-
-pub fn line(width: f32, color: Color32) -> Stroke {
-    Stroke::new(width, color)
-}
+pub const POPUP: Color32 = Color32::from_rgb(34, 28, 36);
+pub const TEXT: Color32 = Color32::from_rgb(240, 236, 238);
+pub const MUTED: Color32 = Color32::from_rgb(186, 180, 186);
+pub const WARN: Color32 = Color32::from_rgb(230, 186, 120);
+pub const OK: Color32 = Color32::from_rgb(126, 196, 154);
+pub const ROW_HOVER: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18);
+/// Rose at about 22% opacity, premultiplied so it can live in a const.
+pub const ROW_SELECTED: Color32 = Color32::from_rgba_premultiplied(43, 12, 17, 56);
 
 pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.visuals = egui::Visuals::dark();
-    let visuals = &mut style.visuals;
-    visuals.panel_fill = Color32::TRANSPARENT;
-    visuals.window_fill = POPUP;
-    visuals.window_stroke = line(1.0, CARD_STROKE);
-    visuals.faint_bg_color = CARD;
-    visuals.extreme_bg_color = Color32::from_rgba_premultiplied(0, 0, 0, 90);
-    visuals.hyperlink_color = ACCENT;
-    visuals.slider_trailing_fill = true;
-    visuals.window_corner_radius = CornerRadius::same(12);
-    visuals.selection.bg_fill = ACCENT_DIM;
-    visuals.selection.stroke = line(1.0, ACCENT);
-
-    let widgets = &mut visuals.widgets;
-    for state in [
-        &mut widgets.noninteractive,
-        &mut widgets.inactive,
-        &mut widgets.hovered,
-        &mut widgets.active,
-        &mut widgets.open,
-    ] {
-        state.corner_radius = CornerRadius::same(8);
-    }
-    widgets.noninteractive.fg_stroke = line(1.0, TEXT);
-    widgets.noninteractive.bg_stroke = line(1.0, CARD_STROKE);
-    widgets.inactive.weak_bg_fill = white(22);
-    widgets.inactive.bg_fill = white(30);
-    widgets.inactive.bg_stroke = Stroke::NONE;
-    widgets.inactive.fg_stroke = line(1.0, TEXT);
-    widgets.hovered.weak_bg_fill = white(34);
-    widgets.hovered.bg_fill = white(42);
-    widgets.hovered.bg_stroke = line(1.0, ACCENT_DIM);
-    widgets.hovered.fg_stroke = line(1.5, Color32::WHITE);
-    widgets.active.weak_bg_fill = white(48);
-    widgets.active.bg_fill = ACCENT;
-    widgets.active.bg_stroke = line(1.0, ACCENT);
-    widgets.active.fg_stroke = line(2.0, Color32::WHITE);
-
-    let spacing = &mut style.spacing;
-    spacing.item_spacing = Vec2::new(8.0, 8.0);
-    spacing.button_padding = Vec2::new(12.0, 5.0);
-    spacing.interact_size.y = 26.0;
-    spacing.slider_width = 200.0;
-    spacing.slider_rail_height = 6.0;
-
-    style.text_styles = [
-        (TextStyle::Heading, FontId::proportional(22.0)),
-        (TextStyle::Body, FontId::proportional(14.0)),
-        (TextStyle::Button, FontId::proportional(14.0)),
-        (TextStyle::Small, FontId::proportional(12.0)),
-        (TextStyle::Monospace, FontId::monospace(13.0)),
-    ]
-    .into();
+    style.visuals = shell_visuals();
+    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+    style.spacing.button_padding = Vec2::new(12.0, 7.0);
+    style.spacing.interact_size.y = 30.0;
     ctx.set_style(style);
+}
+
+fn shell_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.window_fill = POPUP;
+    visuals.panel_fill = Color32::TRANSPARENT;
+    visuals.faint_bg_color = Color32::from_rgba_unmultiplied(255, 255, 255, 14);
+    visuals.extreme_bg_color = Color32::from_rgba_unmultiplied(18, 14, 20, 170);
+    visuals.widgets.noninteractive.fg_stroke.color = Color32::from_rgb(176, 170, 176);
+    visuals.widgets.noninteractive.bg_stroke.color =
+        Color32::from_rgba_unmultiplied(255, 255, 255, 28);
+    let mut idle = visuals.widgets.inactive;
+    idle.bg_fill = Color32::from_rgb(58, 50, 58);
+    idle.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 18);
+    idle.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 36));
+    idle.corner_radius = CornerRadius::same(8);
+    idle.fg_stroke.color = TEXT;
+    let mut hovered = idle;
+    hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 30);
+    hovered.bg_fill = Color32::from_rgb(78, 66, 74);
+    let mut active = hovered;
+    active.bg_fill = ACCENT;
+    active.weak_bg_fill = ACCENT;
+    active.fg_stroke.color = Color32::WHITE;
+    visuals.widgets.inactive = idle;
+    visuals.widgets.hovered = hovered;
+    visuals.widgets.active = active;
+    visuals.widgets.open = hovered;
+    visuals.selection.bg_fill = Color32::from_rgb(190, 52, 74);
+    visuals.selection.stroke = Stroke::new(1.0_f32, Color32::from_rgb(230, 140, 152));
+    visuals.hyperlink_color = Color32::from_rgb(255, 176, 186);
+    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.menu_corner_radius = CornerRadius::same(10);
+    visuals.window_stroke =
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 32));
+    visuals
+}
+
+/// The tint laid over the acrylic backdrop. Opaque when Windows has no backdrop.
+pub fn shell(glass: bool) -> Frame {
+    let fill = if glass {
+        Color32::from_rgba_unmultiplied(16, 12, 18, 150)
+    } else {
+        BG
+    };
+    Frame::new().fill(fill).inner_margin(Margin::same(16))
 }
 
 pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
-        .fill(CARD)
-        .stroke(line(1.0, CARD_STROKE))
-        .corner_radius(12)
+        .fill(Color32::from_rgba_unmultiplied(34, 28, 36, 214))
+        .stroke(Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 32),
+        ))
+        .corner_radius(CornerRadius::same(16))
         .inner_margin(Margin::same(14))
+        .outer_margin(Margin::symmetric(4, 0))
+        .shadow(Shadow {
+            offset: [0, 8],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(80),
+        })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add_contents(ui)
@@ -103,63 +97,41 @@ pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 pub fn card_title(text: &str) -> RichText {
-    RichText::new(text).size(15.0).strong().color(TEXT)
+    RichText::new(text).strong().size(15.0).color(TEXT)
 }
 
 pub fn muted(text: impl Into<String>) -> RichText {
     RichText::new(text).color(MUTED)
 }
 
-pub fn badge(ui: &mut Ui, text: &str, color: Color32) {
+pub fn status_pill(ui: &mut Ui, text: &str, color: Color32) {
     Frame::new()
-        .fill(color.gamma_multiply(0.18))
-        .corner_radius(6)
-        .inner_margin(Margin::symmetric(7, 2))
+        .fill(color.gamma_multiply(0.22))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 3))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).small().strong().color(color));
+            ui.label(RichText::new(text).color(color).size(12.0));
         });
 }
 
 pub fn primary_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).strong().color(BG))
+    egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
         .fill(ACCENT)
-        .min_size(Vec2::new(110.0, 30.0))
+        .corner_radius(CornerRadius::same(10))
+        .min_size(Vec2::new(140.0, 34.0))
 }
 
-pub fn quiet_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text)).min_size(Vec2::new(0.0, 30.0))
-}
-
-pub fn danger_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).color(DANGER)).fill(DANGER.gamma_multiply(0.12))
-}
-
-/// An iOS-style switch.
-pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
-    let size = Vec2::new(40.0, 22.0);
-    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
-    if response.clicked() {
-        *on = !*on;
-        response.mark_changed();
+/// A choice in a row, filled with the accent while it is the current one.
+pub fn choice(ui: &mut Ui, selected: bool, label: &str) -> egui::Response {
+    let text = if selected {
+        RichText::new(label).color(Color32::WHITE)
+    } else {
+        RichText::new(label)
+    };
+    let mut button = egui::Button::new(text);
+    if selected {
+        button = button.fill(ACCENT);
     }
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
-    });
-    if ui.is_rect_visible(rect) {
-        let how_on = ui.ctx().animate_bool(response.id, *on);
-        let radius = 0.5 * rect.height();
-        let off = if response.hovered() { white(60) } else { white(42) };
-        let track = lerp_color(off, ACCENT, how_on);
-        ui.painter()
-            .rect(rect, radius, track, Stroke::NONE, StrokeKind::Inside);
-        let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
-        ui.painter()
-            .circle_filled(egui::pos2(x, rect.center().y), radius - 3.0, Color32::WHITE);
-    }
-    response
-}
-
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgba_premultiplied(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()), mix(a.a(), b.a()))
+    ui.add(button)
 }

@@ -12,7 +12,17 @@ pub const BLUR_DEFAULT: u8 = 40;
 
 /// How the glass is drawn. Frost is the adjustable blur. Acrylic is Windows' milky system glass,
 /// where the same slider sets how milky it is. Missing values in old rules files stay Frost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum BlurStyle {
     #[default]
@@ -89,11 +99,7 @@ pub fn restore_action(saved: &SavedStyle) -> RestoreAction {
 /// "chrome", "chrome.exe", and a full path all become "chrome.exe".
 pub fn normalize_process(name: &str) -> String {
     let trimmed = name.trim().trim_matches('"');
-    let file = trimmed
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
+    let file = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed).trim();
     if file.is_empty() {
         return String::new();
     }
@@ -152,7 +158,10 @@ mod tests {
     #[test]
     fn process_names_normalize() {
         assert_eq!(normalize_process("chrome"), "chrome.exe");
-        assert_eq!(normalize_process("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"), "chrome.exe");
+        assert_eq!(
+            normalize_process("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"),
+            "chrome.exe"
+        );
         assert_eq!(normalize_process("notepad.EXE"), "notepad.EXE");
     }
 }

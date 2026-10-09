@@ -7,11 +7,6 @@ use windows::Graphics::Effects::{
     IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectSource_Impl, IGraphicsEffect_Impl,
 };
 use windows::System::DispatcherQueueController;
-use windows::UI::Composition::Desktop::DesktopWindowTarget;
-use windows::UI::Composition::{
-    CompositionEffectBrush, CompositionEffectFactory, CompositionEffectSourceParameter, Compositor,
-    ContainerVisual,
-};
 use windows::Win32::Foundation::{E_INVALIDARG, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_HOSTBACKDROPBRUSH,
@@ -28,12 +23,17 @@ use windows::Win32::System::WinRT::{
     DQTYPE_THREAD_CURRENT, RO_INIT_SINGLETHREADED,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindow, GetWindowRect, IsWindowVisible,
-    RegisterClassExW, SetWindowPos,
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, ShowWindow, GW_HWNDNEXT, HTTRANSPARENT,
-    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOREDRAW, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_ERASEBKGND, WM_NCHITTEST, WNDCLASSEXW,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    BeginDeferWindowPos, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyWindow,
+    EndDeferWindowPos, GetWindow, GetWindowRect, IsWindowVisible, RegisterClassExW, SetWindowPos,
+    ShowWindow, GW_HWNDNEXT, HTTRANSPARENT, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SW_HIDE, WM_ERASEBKGND, WM_NCHITTEST, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+};
+use windows::UI::Composition::Desktop::DesktopWindowTarget;
+use windows::UI::Composition::{
+    CompositionEffectBrush, CompositionEffectFactory, CompositionEffectSourceParameter, Compositor,
+    ContainerVisual,
 };
 use windows_numerics::Vector2;
 
@@ -189,7 +189,12 @@ pub struct GlassPane {
 impl GlassPane {
     /// Draw `style` at `blur`. Frost uses the adjustable blur when this PC has it, and system
     /// acrylic otherwise. Acrylic always uses the milky system glass.
-    pub fn set_look(&mut self, session: &mut GlassSession, style: BlurStyle, blur: u8) -> Result<(), String> {
+    pub fn set_look(
+        &mut self,
+        session: &mut GlassSession,
+        style: BlurStyle,
+        blur: u8,
+    ) -> Result<(), String> {
         let frost_available = self.visuals.is_some() || session.composition.is_some();
         if style == BlurStyle::Acrylic || !frost_available {
             self.use_acrylic(blur)
@@ -238,8 +243,11 @@ impl GlassPane {
         let moved = self.topmost != Some(topmost) || !self.sits_under(target, bounds);
         if moved {
             let visible = unsafe { IsWindowVisible(self.hwnd).as_bool() };
-            let band = (topmost != self.topmost.unwrap_or(false))
-                .then_some(if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST });
+            let band = (topmost != self.topmost.unwrap_or(false)).then_some(if topmost {
+                HWND_TOPMOST
+            } else {
+                HWND_NOTOPMOST
+            });
             let mut flags = SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER;
             if !visible {
                 flags |= SWP_SHOWWINDOW;
@@ -271,8 +279,11 @@ impl GlassPane {
             return;
         }
         let topmost = crate::target::is_topmost(target);
-        let band = (topmost != self.topmost.unwrap_or(false))
-            .then_some(if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST });
+        let band = (topmost != self.topmost.unwrap_or(false)).then_some(if topmost {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        });
         if band.is_some() {
             self.topmost = Some(topmost);
         }
@@ -313,40 +324,45 @@ impl GlassPane {
     }
 
     /// One z-order update. A band change and the move behind `insert` must land together.
-/// Separate calls paint a frame in between, and that frame is the old window on top.
-fn commit_pos(
-    hwnd: HWND,
-    insert: HWND,
-    x: i32,
-    y: i32,
-    cx: i32,
-    cy: i32,
-    flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
-    band: Option<HWND>,
-) {
-    let band_flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOOWNERZORDER | SWP_NOREDRAW;
-    unsafe {
-        let count = if band.is_some() { 2 } else { 1 };
-        let Ok(mut pending) = BeginDeferWindowPos(count) else {
+    /// Separate calls paint a frame in between, and that frame is the old window on top.
+    fn commit_pos(
+        hwnd: HWND,
+        insert: HWND,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
+        band: Option<HWND>,
+    ) {
+        let band_flags = SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOACTIVATE
+            | SWP_NOCOPYBITS
+            | SWP_NOOWNERZORDER
+            | SWP_NOREDRAW;
+        unsafe {
+            let count = if band.is_some() { 2 } else { 1 };
+            let Ok(mut pending) = BeginDeferWindowPos(count) else {
+                if let Some(band) = band {
+                    let _ = SetWindowPos(hwnd, Some(band), 0, 0, 0, 0, band_flags);
+                }
+                let _ = SetWindowPos(hwnd, Some(insert), x, y, cx, cy, flags);
+                return;
+            };
             if let Some(band) = band {
-                let _ = SetWindowPos(hwnd, Some(band), 0, 0, 0, 0, band_flags);
+                match DeferWindowPos(pending, hwnd, Some(band), 0, 0, 0, 0, band_flags) {
+                    Ok(next) => pending = next,
+                    Err(_) => return,
+                }
             }
-            let _ = SetWindowPos(hwnd, Some(insert), x, y, cx, cy, flags);
-            return;
-        };
-        if let Some(band) = band {
-            match DeferWindowPos(pending, hwnd, Some(band), 0, 0, 0, 0, band_flags) {
-                Ok(next) => pending = next,
-                Err(_) => return,
+            if let Ok(pending) = DeferWindowPos(pending, hwnd, Some(insert), x, y, cx, cy, flags) {
+                let _ = EndDeferWindowPos(pending);
             }
-        }
-        if let Ok(pending) = DeferWindowPos(pending, hwnd, Some(insert), x, y, cx, cy, flags) {
-            let _ = EndDeferWindowPos(pending);
         }
     }
-}
 
-/// Checks the real window rather than a cached position, so outside moves get corrected.
+    /// Checks the real window rather than a cached position, so outside moves get corrected.
     fn sits_under(&self, target: HWND, bounds: RECT) -> bool {
         let mut rect = RECT::default();
         unsafe {
@@ -391,9 +407,8 @@ fn build_composition() -> windows::core::Result<Composition> {
         deviation: mapping::blur_strength_to_radius(mapping::BLUR_DEFAULT),
     }
     .into();
-    let animatable = windows_collections::IIterable::<HSTRING>::from(vec![HSTRING::from(
-        "Blur.BlurAmount",
-    )]);
+    let animatable =
+        windows_collections::IIterable::<HSTRING>::from(vec![HSTRING::from("Blur.BlurAmount")]);
     let factory = compositor.CreateEffectFactoryWithProperties(&effect, &animatable)?;
     Ok(Composition {
         _queue: queue,
@@ -402,16 +417,24 @@ fn build_composition() -> windows::core::Result<Composition> {
     })
 }
 
-fn attach_gaussian(composition: &Composition, hwnd: HWND, blur: u8) -> windows::core::Result<Visuals> {
+fn attach_gaussian(
+    composition: &Composition,
+    hwnd: HWND,
+    blur: u8,
+) -> windows::core::Result<Visuals> {
     set_dwm_bool(hwnd, DWMWA_USE_HOSTBACKDROPBRUSH, true)?;
     let compositor = &composition.compositor;
     let interop: ICompositorDesktopInterop = compositor.cast()?;
     let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, false)? };
     let brush = composition.factory.CreateBrush()?;
-    brush.SetSourceParameter(&HSTRING::from("backdrop"), &compositor.CreateHostBackdropBrush()?)?;
-    brush
-        .Properties()?
-        .InsertScalar(&HSTRING::from("Blur.BlurAmount"), mapping::blur_strength_to_radius(blur))?;
+    brush.SetSourceParameter(
+        &HSTRING::from("backdrop"),
+        &compositor.CreateHostBackdropBrush()?,
+    )?;
+    brush.Properties()?.InsertScalar(
+        &HSTRING::from("Blur.BlurAmount"),
+        mapping::blur_strength_to_radius(blur),
+    )?;
 
     let sprite = compositor.CreateSpriteVisual()?;
     sprite.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
@@ -427,7 +450,11 @@ fn attach_gaussian(composition: &Composition, hwnd: HWND, blur: u8) -> windows::
     })
 }
 
-fn set_dwm_bool(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: bool) -> windows::core::Result<()> {
+fn set_dwm_bool(
+    hwnd: HWND,
+    attribute: DWMWINDOWATTRIBUTE,
+    value: bool,
+) -> windows::core::Result<()> {
     let value = BOOL::from(value);
     unsafe {
         DwmSetWindowAttribute(
@@ -483,7 +510,12 @@ fn register_class() -> Result<(), String> {
         .clone()
 }
 
-unsafe extern "system" fn glass_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn glass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_ERASEBKGND => LRESULT(1),
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
@@ -513,7 +545,10 @@ fn composition_fn() -> Option<SetCompositionFn> {
     *FN.get_or_init(|| unsafe {
         let lib = LoadLibraryW(windows::core::w!("user32.dll")).ok()?;
         let proc = GetProcAddress(lib, windows::core::s!("SetWindowCompositionAttribute"))?;
-        Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, SetCompositionFn>(proc))
+        Some(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            SetCompositionFn,
+        >(proc))
     })
 }
 
@@ -535,7 +570,11 @@ fn clear_acrylic(hwnd: HWND) -> Result<(), String> {
 fn apply_acrylic(hwnd: HWND, blur: u8) -> Result<(), String> {
     let alpha = mapping::blur_strength_to_tint_alpha(blur) as u32;
     // ABGR: a neutral dark tint. The alpha byte is what the slider moves.
-    apply_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, (alpha << 24) | 0x0018_1818)
+    apply_accent(
+        hwnd,
+        ACCENT_ENABLE_ACRYLICBLURBEHIND,
+        (alpha << 24) | 0x0018_1818,
+    )
 }
 
 fn apply_accent(hwnd: HWND, state: i32, color: u32) -> Result<(), String> {

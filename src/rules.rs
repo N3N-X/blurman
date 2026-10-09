@@ -82,7 +82,13 @@ pub struct PersistedWindow {
 }
 
 impl PersistedWindow {
-    pub fn new(hwnd: isize, pid: u32, process_start: u64, process: String, saved: &SavedStyle) -> Self {
+    pub fn new(
+        hwnd: isize,
+        pid: u32,
+        process_start: u64,
+        process: String,
+        saved: &SavedStyle,
+    ) -> Self {
         Self {
             hwnd,
             pid,

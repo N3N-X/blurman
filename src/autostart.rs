@@ -21,10 +21,16 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         return if err == ERROR_SUCCESS || err == ERROR_FILE_NOT_FOUND {
             Ok(())
         } else {
-            Err(format!("Could not turn off start with Windows ({}).", err.0))
+            Err(format!(
+                "Could not turn off start with Windows ({}).",
+                err.0
+            ))
         };
     }
-    let wide: Vec<u16> = command()?.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = command()?
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let err = unsafe {
         RegSetKeyValueW(
             HKEY_CURRENT_USER,
@@ -59,7 +65,15 @@ fn command() -> Result<String, String> {
 fn read() -> Option<String> {
     let mut size = 0u32;
     let err = unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, VALUE_NAME, RRF_RT_REG_SZ, None, None, Some(&mut size))
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            RUN_KEY,
+            VALUE_NAME,
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut size),
+        )
     };
     if err != ERROR_SUCCESS {
         return None;

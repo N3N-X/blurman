@@ -15,12 +15,14 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-    GetAncestor, RegisterClassExW, SetTimer, TranslateMessage, CHILDID_SELF, EVENT_OBJECT_CLOAKED,
-    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, MSG,
-    GA_ROOT, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor, GetMessageW,
+    GetWindow, KillTimer, RegisterClassExW, SetTimer, TranslateMessage, CHILDID_SELF,
+    EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
+    EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND,
+    EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GA_ROOT,
+    GW_OWNER, MSG, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_TIMER,
+    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 /// Backstop while a window is waiting to become a normal app window. Moves arrive as events.
@@ -98,12 +100,14 @@ struct Tracked {
     blur: u8,
     style: BlurStyle,
     pane: GlassPane,
+    /// A menu is open, so the window is solid and the glass is hidden.
+    menu_suspended: bool,
 }
 
 impl Tracked {
     /// Returns whether the glass was restacked. A pane already under the window is left alone.
     fn follow(&mut self, hwnd: HWND) -> bool {
-        if target::is_out_of_view(hwnd) {
+        if self.menu_suspended || target::is_out_of_view(hwnd) {
             self.pane.hide();
             false
         } else {
@@ -136,6 +140,10 @@ struct Engine {
     /// Rules currently skipped because every window is fullscreen, and the status that says so.
     fullscreen_apps: Vec<String>,
     fullscreen_status: Option<String>,
+    /// Open menu popup -> the frosted window that owns it.
+    open_menus: HashMap<isize, isize>,
+    /// Nested Win32 menus. The window stays solid until this returns to zero.
+    menu_depth: HashMap<isize, u32>,
 }
 
 pub fn run(shared: Arc<Shared>) {
@@ -231,6 +239,8 @@ impl Engine {
             settle_armed: false,
             fullscreen_apps: Vec::new(),
             fullscreen_status: None,
+            open_menus: HashMap::new(),
+            menu_depth: HashMap::new(),
         }
     }
 
@@ -346,7 +356,11 @@ impl Engine {
     }
 
     fn update_scan_rate(&mut self) {
-        let ms = if self.early.is_empty() { SCAN_IDLE_MS } else { SCAN_FAST_MS };
+        let ms = if self.early.is_empty() {
+            SCAN_IDLE_MS
+        } else {
+            SCAN_FAST_MS
+        };
         if self.scan_ms == ms {
             return;
         }
@@ -384,7 +398,12 @@ impl Engine {
             if !rule.enabled || self.store.paused {
                 None
             } else {
-                Some((rule.transparency, rule.blur, rule.style, rule.process.clone()))
+                Some((
+                    rule.transparency,
+                    rule.blur,
+                    rule.style,
+                    rule.process.clone(),
+                ))
             }
         };
         let Some((transparency, blur, style, process)) = applied else {
@@ -402,20 +421,46 @@ impl Engine {
     }
 
     fn apply_to(&mut self, key: isize, transparency: u8, blur: u8, style: BlurStyle) {
-        let Engine { glass, tracked, shared, .. } = self;
+        let Engine {
+            glass,
+            tracked,
+            shared,
+            ..
+        } = self;
         let Some(tracked) = tracked.get_mut(&key) else {
             return;
         };
-        apply_values(tracked, target::hwnd_of(key), transparency, blur, style, glass, shared);
+        apply_values(
+            tracked,
+            target::hwnd_of(key),
+            transparency,
+            blur,
+            style,
+            glass,
+            shared,
+        );
     }
 
     fn sync_existing(&mut self, window: &LiveWindow, rule: &Rule) {
-        let Engine { glass, tracked, shared, .. } = self;
+        let Engine {
+            glass,
+            tracked,
+            shared,
+            ..
+        } = self;
         let Some(tracked) = tracked.get_mut(&window.hwnd) else {
             return;
         };
         let hwnd = target::hwnd_of(window.hwnd);
-        apply_values(tracked, hwnd, rule.transparency, rule.blur, rule.style, glass, shared);
+        apply_values(
+            tracked,
+            hwnd,
+            rule.transparency,
+            rule.blur,
+            rule.style,
+            glass,
+            shared,
+        );
         tracked.follow(hwnd);
     }
 
@@ -449,6 +494,7 @@ impl Engine {
             blur: rule.blur,
             style: rule.style,
             pane,
+            menu_suspended: false,
         };
         tracked.follow(hwnd);
         self.tracked.insert(window.hwnd, tracked);
@@ -458,7 +504,8 @@ impl Engine {
     /// The style `hwnd` had before any Blurman touched it: from the early fade, from an earlier
     /// run, or as it is now.
     fn original_style(&mut self, hwnd: isize, pid: u32, process_start: u64) -> SavedStyle {
-        let same = |saved: &PersistedWindow| saved.pid == pid && saved.process_start == process_start;
+        let same =
+            |saved: &PersistedWindow| saved.pid == pid && saved.process_start == process_start;
         let early = self.early.remove(&hwnd).map(|(saved, _)| saved);
         let prior = self.prior.remove(&hwnd);
         early
@@ -505,6 +552,23 @@ impl Engine {
     }
 
     fn on_event(&mut self, event: u32, hwnd: HWND) {
+        // A menu on a layered window is drawn with that window's alpha, and the glass pane can
+        // sit on top of it. Hold the frost off until the menu closes.
+        if event == EVENT_SYSTEM_MENUPOPUPSTART {
+            self.note_menu_start(hwnd);
+            return;
+        }
+        if event == EVENT_SYSTEM_MENUPOPUPEND {
+            self.note_menu_end(hwnd);
+            return;
+        }
+        if event == EVENT_OBJECT_SHOW && target::is_menu_popup(hwnd) {
+            self.note_menu_window(hwnd);
+            return;
+        }
+        if event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY {
+            self.note_menu_window_gone(hwnd);
+        }
         let key = hwnd.0 as isize;
         match event {
             EVENT_OBJECT_DESTROY => {
@@ -517,9 +581,10 @@ impl Engine {
                 }
             }
             EVENT_SYSTEM_FOREGROUND => {
+                self.dismiss_menus_unless(hwnd);
                 self.stack_foreground(hwnd);
                 self.arm_settle();
-            },
+            }
             // New windows of ruled apps are faded as they are created and frosted the moment
             // they appear, are restored, or get their title, instead of on the next scan.
             EVENT_OBJECT_CREATE
@@ -572,7 +637,11 @@ impl Engine {
         let target = if root.0.is_null() { hwnd } else { root };
         let key = target.0 as isize;
         if let Some(tracked) = self.tracked.get_mut(&key) {
-            tracked.pane.stack_under(target);
+            if tracked.menu_suspended {
+                tracked.pane.hide();
+            } else {
+                tracked.pane.stack_under(target);
+            }
         }
     }
 
@@ -612,10 +681,149 @@ impl Engine {
                 }
             }
         }
+        self.sweep_menus();
         self.follow_changed();
     }
 
+    /// The window a menu belongs to, if that window is frosted.
+    fn frosted_owner(&self, hwnd: HWND) -> Option<isize> {
+        let key = hwnd.0 as isize;
+        if self.tracked.contains_key(&key) {
+            return Some(key);
+        }
+        let owner = unsafe { GetWindow(hwnd, GW_OWNER).ok() }?;
+        let owner_key = owner.0 as isize;
+        if self.tracked.contains_key(&owner_key) {
+            return Some(owner_key);
+        }
+        let root = unsafe { GetAncestor(owner, GA_ROOT) };
+        let root_key = root.0 as isize;
+        self.tracked.contains_key(&root_key).then_some(root_key)
+    }
+
+    fn note_menu_start(&mut self, hwnd: HWND) {
+        let Some(owner) = self.frosted_owner(hwnd) else {
+            return;
+        };
+        let depth = self.menu_depth.entry(owner).or_insert(0);
+        *depth = depth.saturating_add(1);
+        self.suspend_owner(owner);
+    }
+
+    fn note_menu_end(&mut self, hwnd: HWND) {
+        let Some(owner) = self.frosted_owner(hwnd) else {
+            return;
+        };
+        let done = match self.menu_depth.get_mut(&owner) {
+            Some(depth) => {
+                *depth = depth.saturating_sub(1);
+                *depth == 0
+            }
+            None => true,
+        };
+        if done {
+            self.menu_depth.remove(&owner);
+        }
+        self.finish_menu(owner);
+    }
+
+    fn note_menu_window(&mut self, hwnd: HWND) {
+        let Some(owner) = self.frosted_owner(hwnd) else {
+            return;
+        };
+        if hwnd.0 as isize == owner {
+            return;
+        }
+        if self.open_menus.insert(hwnd.0 as isize, owner).is_none() {
+            self.suspend_owner(owner);
+        }
+    }
+
+    fn note_menu_window_gone(&mut self, hwnd: HWND) {
+        let Some(owner) = self.open_menus.remove(&(hwnd.0 as isize)) else {
+            return;
+        };
+        self.finish_menu(owner);
+    }
+
+    fn finish_menu(&mut self, owner: isize) {
+        let depth = self.menu_depth.get(&owner).copied().unwrap_or(0);
+        let popups = self.open_menus.values().any(|existing| *existing == owner);
+        if depth == 0 && !popups {
+            self.resume_owner(owner);
+        }
+    }
+
+    /// A click away closes the menu. Drop holds that are not this window or its menu.
+    fn dismiss_menus_unless(&mut self, hwnd: HWND) {
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        let foreground = if root.0.is_null() {
+            hwnd.0 as isize
+        } else {
+            root.0 as isize
+        };
+        let foreground_owner = self.frosted_owner(hwnd);
+        let owners: Vec<isize> = self
+            .menu_depth
+            .keys()
+            .copied()
+            .chain(self.open_menus.values().copied())
+            .filter(|owner| *owner != foreground && foreground_owner != Some(*owner))
+            .collect();
+        let mut seen = HashSet::new();
+        for owner in owners {
+            if !seen.insert(owner) {
+                continue;
+            }
+            self.menu_depth.remove(&owner);
+            self.open_menus.retain(|_, held| *held != owner);
+            self.resume_owner(owner);
+        }
+    }
+
+    /// A popup that vanished without a hide event should not leave the app solid.
+    fn sweep_menus(&mut self) {
+        let stale: Vec<isize> = self
+            .open_menus
+            .iter()
+            .filter(|(token, _)| !target::is_window_showing(target::hwnd_of(**token)))
+            .map(|(token, _)| *token)
+            .collect();
+        for token in stale {
+            self.note_menu_window_gone(target::hwnd_of(token));
+        }
+    }
+
+    fn suspend_owner(&mut self, owner: isize) {
+        let Some(tracked) = self.tracked.get_mut(&owner) else {
+            return;
+        };
+        if tracked.menu_suspended {
+            return;
+        }
+        tracked.menu_suspended = true;
+        let hwnd = target::hwnd_of(owner);
+        let _ = target::set_alpha(hwnd, 255);
+        tracked.pane.hide();
+    }
+
+    fn resume_owner(&mut self, owner: isize) {
+        let Some(tracked) = self.tracked.get_mut(&owner) else {
+            return;
+        };
+        if !tracked.menu_suspended {
+            return;
+        }
+        tracked.menu_suspended = false;
+        let hwnd = target::hwnd_of(owner);
+        let transparency = tracked.transparency;
+        let _ = target::apply_alpha(hwnd, transparency, false);
+        tracked.follow(hwnd);
+    }
+
     fn drop_tracked(&mut self, hwnd: isize) {
+        self.open_menus.retain(|_, owner| *owner != hwnd);
+        self.menu_depth.remove(&hwnd);
         if let Some(tracked) = self.tracked.remove(&hwnd) {
             if target::window_alive(hwnd, tracked.pid, tracked.process_start) {
                 target::restore_alpha(target::hwnd_of(hwnd), &tracked.saved);
@@ -656,7 +864,13 @@ impl Engine {
             .tracked
             .iter()
             .map(|(hwnd, tracked)| {
-                PersistedWindow::new(*hwnd, tracked.pid, tracked.process_start, tracked.process.clone(), &tracked.saved)
+                PersistedWindow::new(
+                    *hwnd,
+                    tracked.pid,
+                    tracked.process_start,
+                    tracked.process.clone(),
+                    &tracked.saved,
+                )
             })
             .chain(self.early.values().map(|(saved, _)| saved.clone()))
             .chain(self.prior.values().cloned())
@@ -736,9 +950,13 @@ fn apply_values(
     shared: &Shared,
 ) {
     if tracked.transparency != transparency {
-        match target::apply_alpha(hwnd, transparency, false) {
-            Ok(()) => tracked.transparency = transparency,
-            Err(err) => shared.set_status(format!("{}: {err}", tracked.process)),
+        if tracked.menu_suspended {
+            tracked.transparency = transparency;
+        } else {
+            match target::apply_alpha(hwnd, transparency, false) {
+                Ok(()) => tracked.transparency = transparency,
+                Err(err) => shared.set_status(format!("{}: {err}", tracked.process)),
+            }
         }
     }
     if tracked.blur != blur || tracked.style != style {
@@ -755,6 +973,7 @@ fn apply_values(
 
 fn install_hooks() -> Vec<HWINEVENTHOOK> {
     let ranges = [
+        (EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUPOPUPEND),
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
@@ -787,7 +1006,12 @@ unsafe extern "system" fn on_win_event(
     _thread: u32,
     _time: u32,
 ) {
-    if hwnd.0.is_null() || id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 {
+    if hwnd.0.is_null() {
+        return;
+    }
+    // Menu events name the popup, not a top-level window, so the window filter would drop them.
+    let menu = event == EVENT_SYSTEM_MENUPOPUPSTART || event == EVENT_SYSTEM_MENUPOPUPEND;
+    if !menu && (id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32) {
         return;
     }
     queue_event(event, hwnd.0 as isize);
@@ -822,6 +1046,11 @@ fn create_host() -> Result<HWND, String> {
     .map_err(|err| format!("Could not create the Blurman host window: {err}"))
 }
 
-unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn host_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }

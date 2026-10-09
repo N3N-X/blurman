@@ -16,22 +16,21 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, RedrawWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
 };
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-    TH32CS_SNAPPROCESS,
-};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess, OpenProcessToken,
     QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetLayeredWindowAttributes, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetLayeredWindowAttributes, SetWindowLongPtrW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow,
+    IsIconic, IsWindow, IsWindowVisible, IsZoomed, SetLayeredWindowAttributes, SetWindowLongPtrW,
     SetWindowPos, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WS_CAPTION, WS_CHILD, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WS_CAPTION, WS_CHILD,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
 };
 
 #[derive(Debug, Clone)]
@@ -60,7 +59,10 @@ pub struct AppGroup {
 }
 
 pub fn list_groups() -> Vec<AppGroup> {
-    let mut windows: Vec<LiveWindow> = visible_windows().into_iter().filter(|window| !window.cloaked).collect();
+    let mut windows: Vec<LiveWindow> = visible_windows()
+        .into_iter()
+        .filter(|window| !window.cloaked)
+        .collect();
     // The list only needs the admin badge. Start times are for the effect thread.
     enrich(&mut windows, false, true);
     let mut groups: Vec<AppGroup> = Vec::new();
@@ -128,7 +130,10 @@ pub fn windows_for_rules(rules: &[Rule]) -> RuledWindows {
             fullscreen_only.push(rule.process.clone());
         }
     }
-    RuledWindows { wanted, fullscreen_only }
+    RuledWindows {
+        wanted,
+        fullscreen_only,
+    }
 }
 
 struct ProcessInfo {
@@ -167,7 +172,11 @@ fn enrich(windows: &mut [LiveWindow], start: bool, elevated: bool) {
     for window in windows {
         let process = info.entry(window.pid).or_insert_with(|| ProcessInfo {
             start: if start { process_start(window.pid) } else { 0 },
-            elevated: if elevated { is_elevated(window.pid) } else { false },
+            elevated: if elevated {
+                is_elevated(window.pid)
+            } else {
+                false
+            },
         });
         if start {
             window.process_start = process.start;
@@ -388,7 +397,10 @@ pub fn early_candidate(hwnd: HWND) -> Option<u32> {
             return None;
         }
         let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() || rect.right - rect.left < 160 || rect.bottom - rect.top < 90 {
+        if GetWindowRect(hwnd, &mut rect).is_err()
+            || rect.right - rect.left < 160
+            || rect.bottom - rect.top < 90
+        {
             return None;
         }
         // A window created already covering the monitor is a fullscreen app. Leave it solid.
@@ -406,8 +418,13 @@ pub fn process_name(pid: u32) -> Option<String> {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut path = [0u16; 1024];
         let mut len = path.len() as u32;
-        let named =
-            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut len).is_ok();
+        let named = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(path.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
         let _ = CloseHandle(process);
         let path = String::from_utf16_lossy(&path[..len as usize]);
         named.then(|| path.rsplit('\\').next().unwrap_or(&path).to_string())
@@ -454,11 +471,12 @@ pub fn process_start(pid: u32) -> u64 {
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
-        let stamp = if GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user).is_ok() {
-            ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64
-        } else {
-            0
-        };
+        let stamp =
+            if GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user).is_ok() {
+                ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64
+            } else {
+                0
+            };
         let _ = CloseHandle(handle);
         stamp
     }
@@ -469,7 +487,9 @@ pub fn process_start(pid: u32) -> u64 {
 /// reads the token instead of testing what can be opened.
 fn is_elevated(pid: u32) -> bool {
     static SELF_ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *SELF_ELEVATED.get_or_init(|| token_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false)) {
+    if *SELF_ELEVATED
+        .get_or_init(|| token_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false))
+    {
         return false;
     }
     unsafe {
@@ -513,7 +533,12 @@ pub fn capture_style(hwnd: HWND) -> SavedStyle {
         if was_layered {
             let mut key = COLORREF::default();
             let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
-            let _ = GetLayeredWindowAttributes(hwnd, Some(&mut key), Some(&mut alpha), Some(&mut flags));
+            let _ = GetLayeredWindowAttributes(
+                hwnd,
+                Some(&mut key),
+                Some(&mut alpha),
+                Some(&mut flags),
+            );
             if flags & LWA_ALPHA != LWA_ALPHA {
                 alpha = 255;
             }
@@ -551,12 +576,37 @@ pub fn apply_alpha(hwnd: HWND, transparency: u8, nudge: bool) -> Result<(), Stri
             }
         }
         let alpha = mapping::transparency_to_alpha(transparency);
-        SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).map_err(|err| err.to_string())?;
-        // A faded window keeps a picture of itself. Without this, that picture stays painted
-        // on top for a frame after you switch away.
-        set_transitions_disabled(hwnd, true);
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA)
+            .map_err(|err| err.to_string())?;
+        // Forcing transitions off skips a menu's fade-in, so the menu stays invisible.
+        // An older run may have set the flag. Turn it off whenever we touch the window.
+        set_transitions_disabled(hwnd, false);
         Ok(())
     }
+}
+
+/// Opaque again, without touching the layered bit. Used while a menu is open.
+pub fn set_alpha(hwnd: HWND, alpha: u8) -> Result<(), String> {
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Err("The window is gone.".into());
+        }
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA)
+            .map_err(|err| err.to_string())
+    }
+}
+
+pub fn is_window_showing(hwnd: HWND) -> bool {
+    unsafe { IsWindow(Some(hwnd)).as_bool() && IsWindowVisible(hwnd).as_bool() }
+}
+
+/// Win32 menus, and the WinUI popup Windows 11 uses for newer context menus.
+pub fn is_menu_popup(hwnd: HWND) -> bool {
+    is_menu_class(&class_name(hwnd))
+}
+
+pub(crate) fn is_menu_class(class: &str) -> bool {
+    class == "#32768" || class.ends_with("PopupWindowSiteBridge")
 }
 
 fn set_transitions_disabled(hwnd: HWND, disabled: bool) {
@@ -616,7 +666,12 @@ mod tests {
     use super::*;
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
-        RECT { left, top, right, bottom }
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
     }
 
     #[test]
@@ -635,6 +690,14 @@ mod tests {
         let monitor = rect(1920, 0, 3840, 1080);
         assert!(covers_monitor(rect(1920, 0, 3840, 1080), monitor));
         assert!(!covers_monitor(rect(0, 0, 1920, 1080), monitor));
+    }
+
+    #[test]
+    fn menu_popups_are_the_win32_menu_and_the_winui_bridge() {
+        assert!(is_menu_class("#32768"));
+        assert!(is_menu_class("Microsoft.UI.Content.PopupWindowSiteBridge"));
+        assert!(!is_menu_class("Chrome_WidgetWin_1"));
+        assert!(!is_menu_class("CabinetWClass"));
     }
 }
 

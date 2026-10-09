@@ -146,6 +146,8 @@ struct BlurmanApp {
     glass: bool,
     /// A window saved from the old narrow layout is widened once.
     window_fitted: bool,
+    /// The 150% display was painting into a window sized as if it were 100%.
+    dpi_matched: bool,
     /// When a slider edit should be written. None while the file matches the sliders.
     pending_save: Option<Instant>,
 }
@@ -176,6 +178,7 @@ impl BlurmanApp {
             startup,
             glass,
             window_fitted: false,
+            dpi_matched: false,
             pending_save: None,
         }
     }
@@ -290,6 +293,34 @@ impl BlurmanApp {
         self.publish();
     }
 
+    /// Grow the window when Windows kept the physical size equal to the point size.
+    ///
+    /// On a 150% display egui then paints 1.5 pixels per point into that smaller
+    /// window, and the right column is clipped.
+    fn match_dpi(&mut self, ctx: &egui::Context) {
+        if self.dpi_matched {
+            return;
+        }
+        // Scale can show up a frame late. A 100% display never latches, and the check is tiny.
+        let Some(ppp) = ctx.native_pixels_per_point() else {
+            return;
+        };
+        if ppp < 1.2 {
+            return;
+        }
+        let points = ctx.screen_rect().size();
+        if points.x < 400.0 || points.y < 300.0 {
+            return;
+        }
+        let hwnd = target::hwnd_of(self.shared.main_window.load(Ordering::SeqCst));
+        if hwnd.0.is_null() {
+            return;
+        }
+        if grow_window_to_pixels(hwnd, points, ppp) {
+            self.dpi_matched = true;
+        }
+    }
+
     fn fit_window(&mut self, ctx: &egui::Context) {
         if self.window_fitted {
             return;
@@ -360,6 +391,43 @@ impl BlurmanApp {
         }
     }
 
+    /// Two equal columns that stay inside the window.
+    ///
+    /// `Ui::columns_const` widens both sides to whichever is wider. A vertical
+    /// scroll area then grows to that width and the window clips the right side.
+    /// The column rect is tall on purpose: inside a scroll area the available
+    /// height is only the viewport, and a column that tall clips the lower cards
+    /// so they never become something you can scroll to.
+    fn two_columns(&mut self, ui: &mut Ui) {
+        let gap = ui.spacing().item_spacing.x;
+        let total = ui.available_width();
+        let col = ((total - gap) / 2.0).max(0.0);
+        let top = ui.cursor().min;
+        let bottom = top.y + 100_000.0;
+        let mut left = column_ui(
+            ui,
+            egui::Rect::from_min_max(top, egui::pos2(top.x + col, bottom)),
+        );
+        let mut right = column_ui(
+            ui,
+            egui::Rect::from_min_max(
+                top + egui::vec2(col + gap, 0.0),
+                egui::pos2(top.x + total, bottom),
+            ),
+        );
+        self.running_apps(&mut left);
+        self.glass_controls(&mut right);
+        right.add_space(8.0);
+        self.startup_card(&mut right);
+        right.add_space(8.0);
+        self.files_card(&mut right);
+        let used = left.min_rect().height().max(right.min_rect().height());
+        ui.allocate_rect(
+            egui::Rect::from_min_size(top, egui::vec2(total, used)),
+            Sense::hover(),
+        );
+    }
+
     fn running_apps(&mut self, ui: &mut Ui) {
         let mut picked = None;
         theme::card(ui, |ui| {
@@ -400,20 +468,27 @@ impl BlurmanApp {
         theme::card(ui, |ui| {
             let ruled = self.selected_rule().is_some();
             ui.horizontal(|ui| {
+                let full = ui.available_width();
+                ui.set_max_width(full);
                 ui.label(theme::card_title("Glass"));
                 if let Some(process) = &self.selected {
                     ui.label(theme::muted("for"));
-                    ui.label(RichText::new(process).strong().color(ACCENT));
+                    ui.add(
+                        egui::Label::new(RichText::new(process).strong().color(ACCENT)).truncate(),
+                    );
                 }
             });
             if self.selected.is_none() {
-                ui.label(theme::muted(
-                    "Pick an app on the left, set the look, then frost it.",
-                ));
+                ui.add(
+                    egui::Label::new(theme::muted(
+                        "Pick an app on the left, set the look, then frost it.",
+                    ))
+                    .wrap(),
+                );
             }
             ui.add_space(4.0);
             let mut moved = false;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(theme::muted("Look"));
                 moved |= look_picker(ui, &mut self.style);
             });
@@ -462,7 +537,7 @@ impl BlurmanApp {
             }
             ui.add_space(6.0);
             ui.add_enabled_ui(self.selected.is_some(), |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ruled {
                         if ui.button("Remove frost").clicked() {
                             self.unfrost_selected();
@@ -519,55 +594,26 @@ impl BlurmanApp {
                     .corner_radius(12)
                     .inner_margin(Margin::symmetric(12, 10))
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let color = if rule.enabled { TEXT } else { MUTED };
-                            structural |= ui
-                                .checkbox(
-                                    &mut rule.enabled,
-                                    RichText::new(&rule.process).strong().color(color),
-                                )
-                                .on_hover_text("Turn this rule on or off.")
-                                .changed();
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("Remove").clicked() {
-                                    delete = Some(rule.process.clone());
-                                }
-                            });
-                        });
-                        ui.horizontal(|ui| {
+                        let row_w = ui.available_width();
+                        ui.set_max_width(row_w);
+                        let (toggled, remove) = rule_heading(ui, &mut rule.enabled, &rule.process);
+                        structural |= toggled;
+                        if remove {
+                            delete = Some(rule.process.clone());
+                        }
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(theme::muted("Look"));
                             let look = look_picker(ui, &mut rule.style);
                             if look && !tweaked.iter().any(|item: &String| item == &rule.process) {
                                 tweaked.push(rule.process.clone());
                             }
                         });
-                        ui.horizontal(|ui| {
-                            // Room left after both labels and both value boxes.
-                            let milky = rule.style == BlurStyle::Acrylic;
-                            ui.spacing_mut().slider_width =
-                                ((ui.available_width() - if milky { 330.0 } else { 290.0 }) / 2.0)
-                                    .clamp(60.0, 180.0);
-                            ui.label(theme::muted("Transparency").small());
-                            let transparency = ui.add(
-                                Slider::new(
-                                    &mut rule.transparency,
-                                    mapping::TRANSPARENCY_MIN..=mapping::TRANSPARENCY_MAX,
-                                )
-                                .suffix("%"),
-                            );
-                            ui.add_space(6.0);
-                            ui.label(theme::muted(if milky { "Milky" } else { "Blur" }).small());
-                            let blur = ui.add(Slider::new(
-                                &mut rule.blur,
-                                mapping::BLUR_MIN..=mapping::BLUR_MAX,
-                            ));
-                            if (transparency.changed() || blur.changed())
-                                && !tweaked.iter().any(|item: &String| item == &rule.process)
-                            {
-                                tweaked.push(rule.process.clone());
-                            }
-                        });
+                        let milky = rule.style == BlurStyle::Acrylic;
+                        if rule_slider_row(ui, &mut rule.transparency, &mut rule.blur, milky)
+                            && !tweaked.iter().any(|item: &String| item == &rule.process)
+                        {
+                            tweaked.push(rule.process.clone());
+                        }
                     });
             }
         });
@@ -635,10 +681,13 @@ impl BlurmanApp {
             ui.label(theme::card_title("Files"));
             ui.label(theme::muted("Rules and settings are saved in"));
             let dir = rules::app_dir();
-            ui.label(
-                RichText::new(dir.display().to_string())
-                    .monospace()
-                    .color(TEXT),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(dir.display().to_string())
+                        .monospace()
+                        .color(TEXT),
+                )
+                .wrap(),
             );
             if ui.button("Open folder").clicked() {
                 let _ = std::fs::create_dir_all(&dir);
@@ -683,6 +732,7 @@ impl eframe::App for BlurmanApp {
         }
 
         self.fit_window(ctx);
+        self.match_dpi(ctx);
         let footer = if self.keeps_in_tray() {
             "Closing hides Blurman in the tray. Exit from the tray puts every app back."
         } else {
@@ -697,16 +747,7 @@ impl eframe::App for BlurmanApp {
                         self.header(ui);
                         ui.add_space(8.0);
                         self.banners(ui);
-                        ui.columns_const(|[ref mut left, ref mut right]| {
-                            self.running_apps(left);
-                            right.vertical(|ui| {
-                                self.glass_controls(ui);
-                                ui.add_space(8.0);
-                                self.startup_card(ui);
-                                ui.add_space(8.0);
-                                self.files_card(ui);
-                            });
-                        });
+                        self.two_columns(ui);
                         ui.add_space(8.0);
                         self.saved_rules(ui);
                         ui.add_space(8.0);
@@ -740,13 +781,84 @@ fn look_picker(ui: &mut Ui, style: &mut BlurStyle) -> bool {
 }
 
 fn labeled_slider(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> egui::Response) -> bool {
+    let budget = ui.available_width();
+    let mut changed = false;
+    ui.allocate_ui_with_layout(
+        egui::vec2(budget, 0.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_width(budget);
+            ui.label(theme::muted(label));
+            ui.spacing_mut().slider_width = slider_rail_width(ui);
+            changed = add(ui).changed();
+        },
+    );
+    changed
+}
+
+/// The name stays on the left and Remove stays on the right. A long name
+/// ellipsizes instead of pushing the button past the window.
+fn rule_heading(ui: &mut Ui, enabled: &mut bool, process: &str) -> (bool, bool) {
+    let row_w = ui.available_width();
+    let mut toggled = false;
+    let mut remove = false;
+    ui.horizontal(|ui| {
+        ui.set_width(row_w);
+        let gap = ui.spacing().item_spacing.x;
+        let name_w = (row_w - button_width(ui, "Remove") - gap).max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(name_w, 0.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_width(name_w);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                let color = if *enabled { TEXT } else { MUTED };
+                toggled = ui
+                    .checkbox(enabled, RichText::new(process).strong().color(color))
+                    .on_hover_text("Turn this rule on or off.")
+                    .changed();
+            },
+        );
+        if ui.button("Remove").clicked() {
+            remove = true;
+        }
+    });
+    (toggled, remove)
+}
+
+/// Transparency and blur on one line, each in its own half of the row.
+fn rule_slider_row(ui: &mut Ui, transparency: &mut u8, blur: &mut u8, milky: bool) -> bool {
+    let row_w = ui.available_width();
+    let gap = ui.spacing().item_spacing.x;
+    // Floor so the two halves plus the gap cannot round past the row and wrap.
+    let pair_w = ((row_w - gap) / 2.0).floor().max(0.0);
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label(theme::muted(label));
-        ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(80.0);
-        changed = add(ui).changed();
+        ui.set_width(row_w);
+        changed |= slider_pair(ui, "Transparency", pair_w, |ui| {
+            ui.add(
+                Slider::new(
+                    transparency,
+                    mapping::TRANSPARENCY_MIN..=mapping::TRANSPARENCY_MAX,
+                )
+                .suffix("%"),
+            )
+        });
+        changed |= slider_pair(ui, if milky { "Milkiness" } else { "Blur" }, pair_w, |ui| {
+            ui.add(Slider::new(blur, mapping::BLUR_MIN..=mapping::BLUR_MAX))
+        });
     });
     changed
+}
+
+fn button_width(ui: &Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, Color32::WHITE)
+        .size()
+        .x;
+    text_w + ui.spacing().button_padding.x * 2.0
 }
 
 fn banner(ui: &mut Ui, color: Color32, add_contents: impl FnOnce(&mut Ui)) {
@@ -762,43 +874,214 @@ fn banner(ui: &mut Ui, color: Color32, add_contents: impl FnOnce(&mut Ui)) {
     ui.add_space(8.0);
 }
 
+/// If the client area is still the point size, size it to `points * pixels_per_point`.
+/// Returns true once the window is the right size or this pass changed it.
+fn grow_window_to_pixels(hwnd: HWND, points: egui::Vec2, pixels_per_point: f32) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    };
+
+    let wanted_w = (points.x * pixels_per_point).round() as i32;
+    let wanted_h = (points.y * pixels_per_point).round() as i32;
+    unsafe {
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client).is_err() {
+            return false;
+        }
+        let client_w = client.right - client.left;
+        let client_h = client.bottom - client.top;
+        if (client_w - wanted_w).abs() <= 12 && (client_h - wanted_h).abs() <= 12 {
+            return true;
+        }
+        // The broken case is a client area that matches the point size, not the pixel size.
+        let width_ratio = client_w as f32 / points.x;
+        let height_ratio = client_h as f32 / points.y;
+        let sized_in_points =
+            (0.85..1.15).contains(&width_ratio) && (0.85..1.15).contains(&height_ratio);
+        if !sized_in_points {
+            return false;
+        }
+        let mut window = RECT::default();
+        if GetWindowRect(hwnd, &mut window).is_err() {
+            return false;
+        }
+        let chrome_w = (window.right - window.left) - client_w;
+        let chrome_h = (window.bottom - window.top) - client_h;
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            wanted_w + chrome_w,
+            wanted_h + chrome_h,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .is_ok()
+    }
+}
+
+fn column_ui(ui: &mut Ui, rect: egui::Rect) -> Ui {
+    let mut column = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::top_down_justified(Align::LEFT)),
+    );
+    column.set_max_width(rect.width());
+    column.set_clip_rect(column.clip_rect().intersect(rect));
+    column
+}
+
+/// A fixed-width label plus slider. The slider uses whatever width is left.
+fn slider_pair(
+    ui: &mut Ui,
+    label: &str,
+    width: f32,
+    add: impl FnOnce(&mut Ui) -> egui::Response,
+) -> bool {
+    let width = width.min(ui.available_width()).max(0.0);
+    let mut changed = false;
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_width(width);
+            ui.label(theme::muted(label).small());
+            ui.spacing_mut().slider_width = slider_rail_width(ui);
+            changed = add(ui).changed();
+        },
+    );
+    changed
+}
+
+/// Width of the number button beside a slider, measured for the widest value.
+///
+/// `slider_width` is only the rail. The value button is drawn after it, so a rail
+/// that uses the whole remaining row paints the number outside the window.
+fn slider_value_width(ui: &Ui) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text = ui
+        .painter()
+        .layout_no_wrap("100%".to_owned(), font, Color32::WHITE)
+        .size()
+        .x;
+    let padded = text + ui.spacing().button_padding.x * 2.0;
+    padded.max(ui.spacing().interact_size.x) + 4.0
+}
+
+/// Rail width that leaves room for the value button in the space still free.
+fn slider_rail_width(ui: &Ui) -> f32 {
+    let gap = ui.spacing().item_spacing.x;
+    (ui.available_width() - gap - slider_value_width(ui)).max(0.0)
+}
+
+enum RowBadge {
+    Pill(String, Color32),
+    Count(String),
+}
+
+fn row_badges(group: &AppGroup, rule: Option<&Rule>) -> Vec<RowBadge> {
+    let mut badges = Vec::new();
+    if group.elevated {
+        badges.push(RowBadge::Pill("Admin".to_string(), WARN));
+    }
+    if group.fullscreen {
+        badges.push(RowBadge::Pill("Fullscreen".to_string(), WARN));
+    }
+    if let Some(rule) = rule {
+        let look = match rule.style {
+            BlurStyle::Frost => "Frost",
+            BlurStyle::Acrylic => "Acrylic",
+        };
+        badges.push(RowBadge::Pill(
+            format!("{look} · {}%", rule.transparency),
+            ACCENT,
+        ));
+    }
+    badges.push(RowBadge::Count(format!(
+        "{} window{}",
+        group.windows,
+        if group.windows == 1 { "" } else { "s" }
+    )));
+    badges
+}
+
+fn draw_badge(ui: &mut Ui, badge: &RowBadge) {
+    match badge {
+        RowBadge::Pill(text, color) => theme::status_pill(ui, text, *color),
+        RowBadge::Count(text) => {
+            ui.label(theme::muted(text).small());
+        }
+    }
+}
+
+fn badge_width(ui: &Ui, badge: &RowBadge) -> f32 {
+    match badge {
+        // Pill frame: 8px padding on each side, plus a little slack so the
+        // one-line layout wraps before the badges cross the row.
+        RowBadge::Pill(text, _) => text_width(ui, text, 12.0) + 24.0,
+        RowBadge::Count(text) => {
+            text_width(ui, text, egui::TextStyle::Small.resolve(ui.style()).size)
+        }
+    }
+}
+
+fn text_width(ui: &Ui, text: &str, size: f32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            egui::FontId::proportional(size),
+            Color32::WHITE,
+        )
+        .size()
+        .x
+}
+
+fn name_block(ui: &mut Ui, group: &AppGroup, width: f32) {
+    ui.vertical(|ui| {
+        ui.set_max_width(width.max(0.0));
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.label(RichText::new(&group.process).strong().color(TEXT));
+        ui.add(egui::Label::new(theme::muted(&group.sample_title).small()).truncate());
+    });
+}
+
 fn app_row(ui: &mut Ui, group: &AppGroup, selected: bool, rule: Option<&Rule>) -> egui::Response {
     let background = ui.painter().add(Shape::Noop);
     let inner = Frame::new()
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let text_width = (ui.available_width() - 160.0).max(140.0);
-                ui.vertical(|ui| {
-                    ui.set_max_width(text_width);
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(RichText::new(&group.process).strong().color(TEXT));
-                    ui.add(egui::Label::new(theme::muted(&group.sample_title).small()).truncate());
+            let row_w = ui.available_width();
+            ui.set_max_width(row_w);
+            let badges = row_badges(group, rule);
+            let gap = ui.spacing().item_spacing.x;
+            let badges_w = badges
+                .iter()
+                .map(|badge| badge_width(ui, badge))
+                .sum::<f32>()
+                + gap * badges.len().saturating_sub(1) as f32
+                + 12.0;
+            // Keep the name on the same line when the badges leave it room.
+            if badges_w + gap + 96.0 <= row_w {
+                ui.horizontal(|ui| {
+                    ui.set_max_width(row_w);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        for badge in badges.iter().rev() {
+                            draw_badge(ui, badge);
+                        }
+                        name_block(ui, group, ui.available_width());
+                    });
                 });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let count = format!(
-                        "{} window{}",
-                        group.windows,
-                        if group.windows == 1 { "" } else { "s" }
-                    );
-                    ui.label(theme::muted(count).small());
-                    if let Some(rule) = rule {
-                        let look = match rule.style {
-                            BlurStyle::Frost => "Frost",
-                            BlurStyle::Acrylic => "Acrylic",
-                        };
-                        theme::status_pill(ui, &format!("{look} · {}%", rule.transparency), ACCENT);
-                    }
-                    if group.fullscreen {
-                        theme::status_pill(ui, "Fullscreen", WARN);
-                    }
-                    if group.elevated {
-                        theme::status_pill(ui, "Admin", WARN);
+            } else {
+                name_block(ui, group, row_w);
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_max_width(row_w);
+                    for badge in &badges {
+                        draw_badge(ui, badge);
                     }
                 });
-            });
+            }
         });
     let rect = inner.response.rect;
     let mut response = ui
@@ -836,4 +1119,143 @@ pub fn window_icon() -> egui::IconData {
 
 pub fn tray_icon() -> egui::IconData {
     decode_icon(include_bytes!("../assets/icon-32.png"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{app_row, labeled_slider, rule_heading, slider_pair};
+    use crate::mapping::BlurStyle;
+    use crate::rules::Rule;
+    use crate::target::AppGroup;
+    use crate::theme;
+    use egui::{Slider, Ui};
+
+    /// How far `add` paints outside a region `width` points wide.
+    fn sticks_out(width: f32, add: impl FnOnce(&mut Ui)) -> f32 {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width, 800.0),
+        ));
+        let mut add = Some(add);
+        let mut overflow = 0.0_f32;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new())
+                .show(ctx, |ui| {
+                    let bounds = ui.max_rect();
+                    let inner = ui.scope(|ui| {
+                        if let Some(add) = add.take() {
+                            add(ui);
+                        }
+                    });
+                    let rect = inner.response.rect;
+                    overflow = (rect.right() - bounds.right())
+                        .max(bounds.left() - rect.left())
+                        .max(0.0);
+                });
+        });
+        overflow
+    }
+
+    #[test]
+    fn slider_rows_stay_inside_a_narrow_column() {
+        let overflow = sticks_out(340.0, |ui| {
+            let mut transparency = 70_u8;
+            let mut blur = 100_u8;
+            labeled_slider(ui, "Transparency", |ui| {
+                ui.add(Slider::new(&mut transparency, 10..=70).suffix("%"))
+            });
+            labeled_slider(ui, "Milkiness", |ui| {
+                ui.add(Slider::new(&mut blur, 1..=100))
+            });
+        });
+        assert!(overflow <= 1.0, "glass sliders stick out by {overflow}px");
+    }
+
+    #[test]
+    fn saved_rule_sliders_share_one_line() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 400.0),
+        ));
+        let mut overflow = 0.0_f32;
+        let mut same_line = false;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new())
+                .show(ctx, |ui| {
+                    let bounds = ui.max_rect();
+                    let mut transparency = 10_u8;
+                    let mut blur = 40_u8;
+                    let mut tops = [0.0_f32, 0.0];
+                    let inner = ui.scope(|ui| {
+                        let row_w = ui.available_width();
+                        let gap = ui.spacing().item_spacing.x;
+                        let pair_w = ((row_w - gap) / 2.0).floor().max(0.0);
+                        ui.horizontal(|ui| {
+                            ui.set_width(row_w);
+                            tops[0] = ui.cursor().top();
+                            slider_pair(ui, "Transparency", pair_w, |ui| {
+                                ui.add(Slider::new(&mut transparency, 10..=70).suffix("%"))
+                            });
+                            tops[1] = ui.cursor().top();
+                            slider_pair(ui, "Blur", pair_w, |ui| {
+                                ui.add(Slider::new(&mut blur, 1..=100))
+                            });
+                        });
+                    });
+                    let rect = inner.response.rect;
+                    overflow = (rect.right() - bounds.right())
+                        .max(bounds.left() - rect.left())
+                        .max(0.0);
+                    same_line = (tops[0] - tops[1]).abs() < 1.0;
+                });
+        });
+        assert!(
+            overflow <= 1.0,
+            "saved-rule sliders stick out by {overflow}px"
+        );
+        assert!(same_line, "transparency and blur wrapped onto two lines");
+    }
+
+    #[test]
+    fn long_rule_name_keeps_remove_inside() {
+        let overflow = sticks_out(320.0, |ui| {
+            let mut enabled = true;
+            rule_heading(
+                ui,
+                &mut enabled,
+                "ApplicationFrameHost.exe with a very long window name",
+            );
+        });
+        assert!(overflow <= 1.0, "rule heading sticks out by {overflow}px");
+    }
+
+    #[test]
+    fn app_rows_stay_inside_the_list() {
+        let group = AppGroup {
+            process: "ApplicationFrameHost.exe".to_string(),
+            sample_title: "A very long window title that should stay inside the row".to_string(),
+            windows: 12,
+            elevated: true,
+            fullscreen: true,
+        };
+        let rule = Rule {
+            process: group.process.clone(),
+            transparency: 70,
+            blur: 100,
+            style: BlurStyle::Acrylic,
+            enabled: true,
+        };
+        let overflow = sticks_out(340.0, |ui| {
+            app_row(ui, &group, true, Some(&rule));
+        });
+        assert!(overflow <= 1.0, "app row sticks out by {overflow}px");
+    }
 }
